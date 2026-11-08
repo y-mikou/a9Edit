@@ -20,8 +20,12 @@
 //! The solution to the former is to keep line caches, which further complicates the architecture.
 //! There's no solution for the latter. However, there's a chance that the performance will still be sufficient.
 
+mod forbidden;
 mod gap_buffer;
 mod navigation;
+mod ruby;
+
+pub use forbidden::ForbiddenRules;
 
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
@@ -47,7 +51,7 @@ use crate::lsh::cache::HighlighterCache;
 use crate::lsh::{HighlightKind, Highlighter, Language};
 use crate::oklab::StraightRgba;
 use crate::simd::memchr2;
-use crate::unicode::{self, Cursor, MeasurementConfig};
+use crate::unicode::{self, Cursor, HiddenText, MeasurementConfig};
 use crate::{icu, simd};
 
 /// The margin template is used for line numbers.
@@ -249,14 +253,20 @@ pub struct TextBuffer {
     // Must be cleared on every edit or reflow.
     cursor_for_rendering: Option<Cursor>,
     selection: Option<TextBufferSelection>,
+    selection_latch: Option<Point>,
     selection_generation: u32,
     search: Option<UnsafeCell<ActiveSearch>>,
     highlighter_cache: HighlighterCache,
+    ruby_cache: ruby::RubyCache,
+    ruby_display: bool,
+    forbidden_rules: Option<Rc<ForbiddenRules>>,
+    warning_cache: std::cell::RefCell<forbidden::WarningCache>,
 
     width: CoordType,
     margin_width: CoordType,
     margin_enabled: bool,
     word_wrap_column: CoordType,
+    wrap_chars: Option<CoordType>,
     word_wrap_enabled: bool,
     tab_size: CoordType,
     indent_with_tabs: bool,
@@ -299,14 +309,20 @@ impl TextBuffer {
             cursor: Default::default(),
             cursor_for_rendering: None,
             selection: None,
+            selection_latch: None,
             selection_generation: 0,
             search: None,
             highlighter_cache: HighlighterCache::new(),
+            ruby_cache: ruby::RubyCache::default(),
+            ruby_display: false,
+            forbidden_rules: None,
+            warning_cache: Default::default(),
 
             width: 0,
             margin_width: 0,
             margin_enabled: false,
             word_wrap_column: 0,
+            wrap_chars: None,
             word_wrap_enabled: false,
             tab_size: 4,
             indent_with_tabs: false,
@@ -538,6 +554,190 @@ impl TextBuffer {
         }
     }
 
+    /// The configured wrap limit in full-width Japanese characters.
+    /// Half-width characters occupy half a character; None follows the viewport.
+    pub fn wrap_chars(&self) -> Option<CoordType> {
+        self.wrap_chars
+    }
+
+    /// Set the wrap limit in full-width Japanese characters.
+    pub fn set_wrap_chars(&mut self, count: Option<CoordType>) {
+        let count = count.map(|count| count.clamp(1, CoordType::MAX / 2));
+        if self.wrap_chars != count {
+            self.wrap_chars = count;
+            self.reflow();
+            self.make_cursor_visible();
+        }
+    }
+
+    /// Show ruby/emphasis bases, preserving the original markup for editing and saving.
+    pub fn set_ruby_display(&mut self, enabled: bool) {
+        if self.ruby_display != enabled {
+            self.ruby_display = enabled;
+            self.reflow();
+            self.make_cursor_visible();
+        }
+    }
+
+    fn ruby_line(&self, offset: usize) -> Rc<ruby::Line> {
+        self.ruby_cache.prepare(self.buffer.generation());
+        self.ruby_cache.line(&self.buffer, offset)
+    }
+
+    /// Reading of the ruby base at the caret, if any.
+    pub fn ruby_reading_at_cursor(&self) -> Option<String> {
+        if !self.ruby_display {
+            return None;
+        }
+        self.ruby_line(self.cursor.offset)
+            .ruby
+            .iter()
+            .find(|ruby| (ruby.markup.start..ruby.base.end).contains(&self.cursor.offset))
+            .and_then(|ruby| match &ruby.kind {
+                ruby::AnnotationKind::Ruby(reading) => Some(reading.clone()),
+                ruby::AnnotationKind::Emphasis => None,
+            })
+    }
+
+    /// Annotation of the displayed base at the caret, for the message area.
+    pub fn annotation_at_cursor(&self) -> Option<String> {
+        if !self.ruby_display {
+            return None;
+        }
+        self.ruby_line(self.cursor.offset)
+            .ruby
+            .iter()
+            .find(|ruby| (ruby.markup.start..ruby.base.end).contains(&self.cursor.offset))
+            .map(|ruby| match &ruby.kind {
+                ruby::AnnotationKind::Ruby(reading) => format!("ルビ:[{reading}]"),
+                ruby::AnnotationKind::Emphasis => "圏点:[﹅]".to_string(),
+            })
+    }
+
+    pub fn set_forbidden_rules(&mut self, rules: Option<Rc<ForbiddenRules>>) {
+        self.forbidden_rules = rules;
+        *self.warning_cache.borrow_mut() = Default::default();
+    }
+
+    fn forbidden_line_warnings(&self, start: Cursor) -> Rc<Vec<forbidden::Warning>> {
+        let key = (self.buffer.generation(), self.word_wrap_column, self.ruby_display);
+        {
+            let mut cache = self.warning_cache.borrow_mut();
+            if cache.key != Some(key) {
+                cache.key = Some(key);
+                cache.lines.clear();
+            }
+            if let Some(warnings) = cache.lines.get(&start.offset) {
+                return warnings.clone();
+            }
+        }
+        let mut cells = Vec::new();
+        if let Some(rules) = &self.forbidden_rules
+            && self.word_wrap_column > 0
+        {
+            let mut cursor = start;
+            let mut config = self.measurement_config().with_cursor(start);
+            loop {
+                let next = config
+                    .goto_logical(Point { x: cursor.logical_pos.x + 1, y: cursor.logical_pos.y });
+                if next.offset <= cursor.offset || next.logical_pos.y != start.logical_pos.y {
+                    break;
+                }
+                let width = next.column - cursor.column;
+                if width > 0 {
+                    let mut pos = next.visual_pos;
+                    if pos.x == 0 {
+                        pos.y -= 1;
+                        pos.x = self.word_wrap_column;
+                    }
+                    pos.x -= width;
+                    let mut bytes = Vec::new();
+                    self.buffer.extract_raw(cursor.offset..next.offset, &mut bytes, usize::MAX);
+                    cells.push(forbidden::Cell {
+                        source: cursor.offset..next.offset,
+                        text: String::from_utf8_lossy(&bytes).into_owned(),
+                        pos,
+                        width,
+                    });
+                }
+                cursor = next;
+            }
+            let bases = if self.ruby_display {
+                self.ruby_line(start.offset)
+                    .ruby
+                    .iter()
+                    .filter(|ruby| matches!(ruby.kind, ruby::AnnotationKind::Ruby(_)))
+                    .map(|ruby| ruby.base.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let warnings = Rc::new(forbidden::warnings(&cells, rules, &bases));
+            self.warning_cache.borrow_mut().lines.insert(start.offset, warnings.clone());
+            return warnings;
+        }
+        Rc::new(Vec::new())
+    }
+
+    pub fn forbidden_warning_at_cursor(&self) -> Option<String> {
+        if self.forbidden_rules.is_none() || self.word_wrap_column <= 0 {
+            return None;
+        }
+        let cursor = self.skip_hidden_ruby(self.cursor, 1);
+        let start = self.goto_line_start(cursor, cursor.logical_pos.y);
+        self.forbidden_line_warnings(start)
+            .iter()
+            .find(|warning| warning.source.contains(&cursor.offset))
+            .map(|warning| warning.reasons.join(" "))
+    }
+
+    fn hidden_ruby_range(&self, offset: usize) -> Option<Range<usize>> {
+        if !self.ruby_display {
+            return None;
+        }
+        self.ruby_cache.prepare(self.buffer.generation());
+        self.ruby_cache.hidden_range(&self.buffer, offset)
+    }
+
+    // Keep delimiters/readings intact when editing part of a base. Selecting the
+    // whole base includes its complete source markup for copy, replacement and deletion.
+    fn ruby_source_range(&self, beg: Cursor, end: Cursor) -> (Cursor, Cursor) {
+        if !self.ruby_display {
+            return (beg, end);
+        }
+        let mut start = beg.offset;
+        let mut finish = end.offset;
+        for offset in [beg.offset, end.offset.saturating_sub(1)] {
+            let line = self.ruby_line(offset);
+            for ruby in &line.ruby {
+                if start <= ruby.base.start
+                    && finish >= ruby.base.end
+                    && start < ruby.markup.end
+                    && finish > ruby.markup.start
+                {
+                    start = start.min(ruby.markup.start);
+                    finish = finish.max(ruby.markup.end);
+                    continue;
+                }
+                if (ruby.markup.start..ruby.base.start).contains(&start) {
+                    start = ruby.base.start;
+                } else if (ruby.base.end..ruby.markup.end).contains(&start) {
+                    start = ruby.markup.end;
+                }
+                if finish > ruby.base.end && finish <= ruby.markup.end {
+                    finish = ruby.base.end;
+                } else if finish > ruby.markup.start && finish <= ruby.base.start {
+                    finish = ruby.markup.start;
+                }
+            }
+        }
+        if start >= finish {
+            return (beg, beg);
+        }
+        let beg = self.cursor_move_to_offset_internal(beg, start);
+        (beg, self.cursor_move_to_offset_internal(beg, finish))
+    }
+
     /// Set the width available for layout.
     ///
     /// Ideally this would be a pure UI concern, but the text buffer needs this
@@ -629,6 +829,9 @@ impl TextBuffer {
     }
 
     fn reflow_internal(&mut self, force: bool) {
+        if force {
+            self.warning_cache.borrow_mut().lines.clear();
+        }
         let word_wrap_column_before = self.word_wrap_column;
 
         {
@@ -643,8 +846,11 @@ impl TextBuffer {
 
             let text_width = self.text_width();
             // 2 columns are required, because otherwise wide glyphs wouldn't ever fit.
-            self.word_wrap_column =
-                if self.word_wrap_enabled && text_width >= 2 { text_width } else { 0 };
+            self.word_wrap_column = if self.word_wrap_enabled && text_width >= 2 {
+                self.wrap_chars.map_or(text_width, |count| (count * 2).min(text_width))
+            } else {
+                0
+            };
         }
 
         self.cursor_for_rendering = None;
@@ -1026,6 +1232,49 @@ impl TextBuffer {
         self.selection.is_some()
     }
 
+    pub fn is_selection_latched(&self) -> bool {
+        self.selection_latch.is_some()
+    }
+
+    pub fn start_selection_latch(&mut self) {
+        if self.selection_latch.is_none() {
+            self.clear_selection();
+            self.selection_latch = Some(self.cursor.logical_pos);
+        }
+    }
+
+    pub fn finish_selection_latch(&mut self) {
+        self.selection_latch = None;
+    }
+
+    /// Normalize textarea keys while keeping Enter/Escape from editing the text.
+    pub(crate) fn selection_latch_key(
+        &mut self,
+        input: crate::input::InputKey,
+    ) -> Option<crate::input::InputKey> {
+        use crate::input::{kbmod, vk};
+        let key = input.key();
+        let arrow = matches!(key, vk::LEFT | vk::RIGHT | vk::UP | vk::DOWN);
+        let modifiers = input.modifiers();
+        if arrow && modifiers.contains(kbmod::CTRL) && modifiers.contains(kbmod::SHIFT) {
+            self.start_selection_latch();
+        }
+        if self.is_selection_latched() {
+            if arrow || matches!(key, vk::HOME | vk::END | vk::PRIOR | vk::NEXT) {
+                return Some(kbmod::SHIFT | key);
+            }
+            if key == vk::RETURN {
+                self.finish_selection_latch();
+                return None;
+            }
+            if key == vk::ESCAPE {
+                self.clear_selection();
+                return None;
+            }
+        }
+        Some(input)
+    }
+
     fn set_selection(&mut self, selection: Option<TextBufferSelection>) -> u32 {
         self.selection = selection.filter(|s| s.beg != s.end);
         self.selection_generation = self.selection_generation.wrapping_add(1);
@@ -1108,6 +1357,7 @@ impl TextBuffer {
 
     /// Destroy the current selection.
     pub fn clear_selection(&mut self) -> bool {
+        self.finish_selection_latch();
         let had_selection = self.selection.is_some();
         self.set_selection(None);
         had_selection
@@ -1482,9 +1732,12 @@ impl TextBuffer {
     }
 
     fn measurement_config(&self) -> MeasurementConfig<'_> {
+        self.ruby_cache.prepare(self.buffer.generation());
         MeasurementConfig::new(&self.buffer)
             .with_word_wrap_column(self.word_wrap_column)
+            .with_wrap_at_any_cluster(self.wrap_chars.is_some())
             .with_tab_size(self.tab_size)
+            .with_hidden_text(if self.ruby_display { Some(&self.ruby_cache) } else { None })
     }
 
     fn goto_line_start(&self, cursor: Cursor, y: CoordType) -> Cursor {
@@ -1641,10 +1894,61 @@ impl TextBuffer {
             }
         }
 
-        self.measurement_config().with_cursor(cursor).goto_visual(pos)
+        let cursor = self.measurement_config().with_cursor(cursor).goto_visual(pos);
+        self.skip_hidden_ruby(cursor, 1)
     }
 
     fn cursor_move_delta_internal(
+        &self,
+        cursor: Cursor,
+        granularity: CursorMovement,
+        delta: CoordType,
+    ) -> Cursor {
+        if !self.ruby_display || delta == 0 {
+            return self.cursor_move_delta_source_internal(cursor, granularity, delta);
+        }
+        let cursor = self.skip_hidden_ruby(cursor, 1);
+        match granularity {
+            CursorMovement::Word => {
+                let moved = self.cursor_move_delta_source_internal(cursor, granularity, delta);
+                self.skip_hidden_ruby(moved, delta.signum())
+            }
+            CursorMovement::Grapheme => {
+                let mut cursor = cursor;
+                for _ in 0..delta.unsigned_abs() {
+                    let next = self.cursor_move_delta_source_internal(
+                        cursor,
+                        CursorMovement::Grapheme,
+                        delta.signum(),
+                    );
+                    let next = self.skip_hidden_ruby(next, delta.signum());
+                    if cursor.offset == next.offset {
+                        break;
+                    }
+                    cursor = next;
+                }
+                cursor
+            }
+        }
+    }
+
+    fn skip_hidden_ruby(&self, mut cursor: Cursor, direction: CoordType) -> Cursor {
+        while let Some(range) = self.hidden_ruby_range(cursor.offset) {
+            if direction > 0 {
+                cursor = self.cursor_move_to_offset_internal(cursor, range.end);
+            } else {
+                cursor = self.cursor_move_to_offset_internal(cursor, range.start);
+                if cursor.offset == 0 {
+                    break;
+                }
+                cursor =
+                    self.cursor_move_delta_source_internal(cursor, CursorMovement::Grapheme, -1);
+            }
+        }
+        cursor
+    }
+
+    fn cursor_move_delta_source_internal(
         &self,
         mut cursor: Cursor,
         granularity: CursorMovement,
@@ -1742,16 +2046,17 @@ impl TextBuffer {
     /// This function performs no checks that the cursor is valid. "Valid" in this case means
     /// that the TextBuffer has not been modified since you received the cursor from this class.
     pub unsafe fn set_cursor(&mut self, cursor: Cursor) {
+        self.finish_selection_latch();
         self.set_cursor_internal(cursor);
         self.last_history_type = HistoryType::Other;
         self.set_selection(None);
     }
 
     fn set_cursor_for_selection(&mut self, cursor: Cursor) {
-        let beg = match self.selection {
+        let beg = self.selection_latch.unwrap_or(match self.selection {
             Some(TextBufferSelection { beg, .. }) => beg,
             None => self.cursor.logical_pos,
-        };
+        });
 
         self.set_cursor_internal(cursor);
         self.last_history_type = HistoryType::Other;
@@ -1956,11 +2261,20 @@ impl TextBuffer {
 
                         // Anything that isn't whitespace is copied as-is.
                         // The framebuffer takes care of sanitizing it.
-                        line.extend_from_slice(&*scratch, &chunk[beg..off]);
+                        self.append_visible_text(
+                            &scratch,
+                            &mut line,
+                            &chunk[beg..off],
+                            global_off + beg,
+                        );
 
                         while off < chunk.len() && matches!(chunk[off], b' ' | b'\t') {
                             let is_tab = chunk[off] == b'\t';
                             let global_off = global_off + off;
+                            if self.hidden_ruby_range(global_off).is_some() {
+                                off += 1;
+                                continue;
+                            }
                             let visualize = selection_off.contains(&global_off);
                             let mut whitespace = TAB_WHITESPACE;
                             let mut prefix_add = 0;
@@ -2022,6 +2336,7 @@ impl TextBuffer {
         let logical_y_beg = self.cursor_for_rendering.unwrap().logical_pos.y;
         let logical_y_end = cursor.logical_pos.y + 1;
         self.render_apply_highlights(origin, destination, logical_y_beg..logical_y_end, fb);
+        self.render_apply_ruby(origin, destination, logical_y_beg..logical_y_end, fb);
 
         // Colorize the margin that we wrote above.
         if self.margin_width > 0 {
@@ -2085,7 +2400,119 @@ impl TextBuffer {
             }
         }
 
+        self.render_apply_forbidden(origin, destination, logical_y_beg..logical_y_end, fb);
+
         Some(RenderResult { visual_pos_x_max })
+    }
+
+    fn render_apply_forbidden(
+        &self,
+        origin: Point,
+        destination: Rect,
+        lines: Range<CoordType>,
+        fb: &mut Framebuffer,
+    ) {
+        if self.forbidden_rules.is_none() || self.word_wrap_column <= 0 {
+            return;
+        }
+        let mut cursor = self.cursor_for_rendering.unwrap();
+        let text_left = destination.left + self.margin_width;
+        let selection = self.selection_range().map(|(beg, end)| beg.offset..end.offset);
+        for y in lines {
+            cursor = self.goto_line_start(cursor, y);
+            for warning in self.forbidden_line_warnings(cursor).iter() {
+                let top = destination.top + warning.pos.y - origin.y;
+                if top < destination.top || top >= destination.bottom {
+                    continue;
+                }
+                let left = text_left + warning.pos.x - origin.x;
+                let rect = Rect {
+                    left: left.max(text_left),
+                    top,
+                    right: (left + warning.width).min(destination.right),
+                    bottom: top + 1,
+                };
+                if rect.left < rect.right {
+                    fb.blend_bg(rect, fb.indexed(IndexedColor::Yellow));
+                    fb.blend_fg(rect, fb.indexed(IndexedColor::Red));
+                    if let Some(selection) = &selection
+                        && warning.source.start < selection.end
+                        && warning.source.end > selection.start
+                    {
+                        fb.replace_attr(rect, Attributes::Underlined, Attributes::Underlined);
+                    }
+                }
+            }
+        }
+    }
+
+    fn append_visible_text<'a>(
+        &self,
+        arena: &'a Arena,
+        output: &mut BVec<'a, u8>,
+        bytes: &[u8],
+        offset: usize,
+    ) {
+        if !self.ruby_display {
+            output.extend_from_slice(arena, bytes);
+            return;
+        }
+        let line = self.ruby_line(offset);
+        let end = offset + bytes.len();
+        let mut cursor = offset;
+        for ruby in &line.ruby {
+            for hidden in [ruby.markup.start..ruby.base.start, ruby.base.end..ruby.markup.end] {
+                if hidden.end <= cursor || hidden.start >= end {
+                    continue;
+                }
+                if cursor < hidden.start {
+                    output.extend_from_slice(arena, &bytes[cursor - offset..hidden.start - offset]);
+                }
+                cursor = hidden.end.min(end);
+            }
+        }
+        output.extend_from_slice(arena, &bytes[cursor - offset..]);
+    }
+
+    fn render_apply_ruby(
+        &self,
+        origin: Point,
+        destination: Rect,
+        logical_y_range: Range<CoordType>,
+        fb: &mut Framebuffer,
+    ) {
+        if !self.ruby_display {
+            return;
+        }
+        let text_left = destination.left + self.margin_width;
+        let mut cursor = self.cursor_for_rendering.unwrap();
+        for y in logical_y_range {
+            cursor = self.goto_line_start(cursor, y);
+            let line = self.ruby_line(cursor.offset);
+            for ruby in &line.ruby {
+                let beg = self.cursor_move_to_offset_internal(cursor, ruby.base.start);
+                let end = self.cursor_move_to_offset_internal(beg, ruby.base.end);
+                for visual_y in beg.visual_pos.y.max(origin.y)
+                    ..=end.visual_pos.y.min(origin.y + destination.height() - 1)
+                {
+                    let left = if visual_y == beg.visual_pos.y { beg.visual_pos.x } else { 0 };
+                    let right = if visual_y == end.visual_pos.y {
+                        end.visual_pos.x
+                    } else {
+                        self.word_wrap_column
+                    };
+                    let rect = Rect {
+                        left: (text_left + left - origin.x).max(text_left),
+                        right: (text_left + right - origin.x).min(destination.right),
+                        top: destination.top + visual_y - origin.y,
+                        bottom: destination.top + visual_y - origin.y + 1,
+                    };
+                    if rect.left < rect.right {
+                        fb.blend_fg(rect, fb.indexed(IndexedColor::BrightYellow));
+                    }
+                }
+            }
+        }
     }
 
     fn render_apply_highlights(
@@ -2461,6 +2888,7 @@ impl TextBuffer {
         if delta == 0 {
             return;
         }
+        self.finish_selection_latch();
 
         let mut beg;
         let mut end;
@@ -2483,6 +2911,11 @@ impl TextBuffer {
             if beg.offset > end.offset {
                 mem::swap(&mut beg, &mut end);
             }
+        }
+
+        (beg, end) = self.ruby_source_range(beg, end);
+        if beg.offset == end.offset {
+            return;
         }
 
         self.edit_begin(HistoryType::Delete, beg);
@@ -2743,6 +3176,7 @@ impl TextBuffer {
         let beg = self.cursor_move_to_logical_internal(self.cursor, beg);
         let end = self.cursor_move_to_logical_internal(beg, end);
 
+        let (beg, end) = self.ruby_source_range(beg, end);
         if beg.offset < end.offset { Some((beg, end)) } else { None }
     }
 
@@ -2762,6 +3196,7 @@ impl TextBuffer {
     /// Starts a new edit operation.
     /// This is used for tracking the undo/redo history.
     fn edit_begin(&mut self, history_type: HistoryType, cursor: Cursor) {
+        self.finish_selection_latch();
         self.active_edit_depth += 1;
         if self.active_edit_depth > 1 {
             return;
@@ -2808,7 +3243,7 @@ impl TextBuffer {
         // may have changed. This includes even text before the insertion point up to the line
         // start, because this write may have joined with a word before the initial cursor.
         // See other uses of `word_wrap_cursor_next_line` in this function.
-        if self.word_wrap_column > 0 {
+        if self.word_wrap_column > 0 || self.ruby_display {
             let safe_start = self.goto_line_start(cursor, cursor.logical_pos.y);
             let next_line = self.cursor_move_to_logical_internal(
                 cursor,
@@ -2892,7 +3327,9 @@ impl TextBuffer {
             let target = self.cursor.logical_pos;
 
             // From our safe position we can measure the actual visual position of the cursor.
-            self.set_cursor_internal(self.cursor_move_to_logical_internal(info.safe_start, target));
+            // Newlines may have increased the visual row count. Install the
+            // measured cursor before updating that count, as in undo_redo().
+            self.cursor = self.cursor_move_to_logical_internal(info.safe_start, target);
 
             // If content is added at the insertion position, that's not a problem:
             // We can just remeasure the height of this one line and calculate the delta.
@@ -2954,6 +3391,8 @@ impl TextBuffer {
                 to.push_back(g);
             }
 
+            self.finish_selection_latch();
+
             let change = {
                 let to = if undo { &self.redo_stack } else { &self.undo_stack };
                 to.back().unwrap()
@@ -2967,7 +3406,7 @@ impl TextBuffer {
                 self.cursor_move_to_logical_internal(self.cursor, change.cursor)
             };
 
-            let safe_cursor = if self.word_wrap_column > 0 {
+            let safe_cursor = if self.word_wrap_column > 0 || self.ruby_display {
                 // If word-wrap is enabled, we need to move the cursor to the beginning of the line.
                 // This is because the undo/redo operation may have changed the visual position of the cursor.
                 self.goto_line_start(cursor, cursor.logical_pos.y)
@@ -3109,12 +3548,436 @@ fn detect_bom(bytes: &[u8]) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchOptions, TextBuffer};
+    use super::{CursorMovement, SearchOptions, TextBuffer};
+    use crate::framebuffer::Framebuffer;
+    use crate::helpers::{Point, Rect, Size};
+    use stdext::arena::scratch_arena;
 
     fn buffer_contents(buf: &mut TextBuffer) -> String {
         let mut str = String::new();
         buf.save_as_string(&mut str);
         str
+    }
+
+    fn ruby_buffer(text: &str) -> TextBuffer {
+        let mut buf = TextBuffer::new(false).unwrap();
+        buf.set_crlf(false);
+        buf.set_ruby_display(true);
+        buf.write_raw(text.as_bytes());
+        buf.set_width(80);
+        buf.cursor_move_to_logical(Point::default());
+        buf
+    }
+
+    fn forbidden_buffer(text: &str, width: isize, sequences: &[&str]) -> TextBuffer {
+        let mut buf = ruby_buffer(text);
+        buf.set_forbidden_rules(Some(std::rc::Rc::new(super::ForbiddenRules {
+            line_start: "、。（".to_string(),
+            line_end: "（".to_string(),
+            paragraph_start_allowed: "（".to_string(),
+            inseparable: sequences.iter().map(|text| text.to_string()).collect(),
+        })));
+        buf.set_wrap_chars(Some(width));
+        buf.set_word_wrap(true);
+        buf.set_width(80);
+        buf
+    }
+
+    #[test]
+    fn forbidden_heads_tails_and_paragraph_exception_follow_display_rows() {
+        let source = "あい、う\nあ（いう\n（あいう";
+        let mut buf = forbidden_buffer(source, 2, &[]);
+        buf.cursor_move_to_offset("あい".len());
+        assert!(buf.forbidden_warning_at_cursor().unwrap().contains("行頭禁則"));
+        let start = buf.goto_line_start(buf.cursor, 0);
+        let warnings = buf.forbidden_line_warnings(start);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].pos, Point { x: 0, y: 1 });
+        assert_eq!(warnings[0].width, 2);
+        buf.cursor_move_to_offset("あい、う\nあ".len());
+        assert!(buf.forbidden_warning_at_cursor().unwrap().contains("行末禁則"));
+        buf.cursor_move_to_offset("あい、う\nあ（いう\n".len());
+        assert_eq!(buf.forbidden_warning_at_cursor(), None);
+        assert_eq!(buffer_contents(&mut buf), source);
+        buf.set_word_wrap(false);
+        buf.set_width(80);
+        buf.cursor_move_to_offset("あい".len());
+        assert_eq!(buf.forbidden_warning_at_cursor(), None);
+    }
+
+    #[test]
+    fn forbidden_sequences_recompute_after_resize_edits_and_undo() {
+        let mut buf = forbidden_buffer("aAB", 2, &["AB"]);
+        let start = buf.goto_line_start(buf.cursor, 0);
+        assert!(buf.forbidden_line_warnings(start).is_empty());
+        buf.set_width(2);
+        let warnings = buf.forbidden_line_warnings(start);
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].pos, Point { x: 1, y: 0 });
+        assert_eq!(warnings[1].pos, Point { x: 0, y: 1 });
+        buf.write_canon(b"a");
+        let start = buf.goto_line_start(buf.cursor, 0);
+        assert!(buf.forbidden_line_warnings(start).is_empty());
+        buf.undo();
+        let start = buf.goto_line_start(buf.cursor, 0);
+        assert_eq!(buf.forbidden_line_warnings(start).len(), 2);
+        buf.set_width(80);
+        let start = buf.goto_line_start(buf.cursor, 0);
+        assert!(buf.forbidden_line_warnings(start).is_empty());
+    }
+
+    #[test]
+    fn forbidden_sequences_include_overlaps_and_combining_clusters() {
+        let buf = forbidden_buffer("aaa", 1, &["aa"]);
+        let warnings = buf.forbidden_line_warnings(buf.goto_line_start(buf.cursor, 0));
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].source, 1..2);
+        assert_eq!(warnings[1].source, 2..3);
+        let buf = forbidden_buffer("か\u{3099}い", 1, &["か\u{3099}い"]);
+        let warnings = buf.forbidden_line_warnings(buf.goto_line_start(buf.cursor, 0));
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].source, 0.."か\u{3099}".len());
+        assert!(warnings.iter().all(|warning| warning.width == 2));
+    }
+
+    #[test]
+    fn forbidden_uses_annotation_bases_and_ignores_hidden_readings() {
+        let mut buf = forbidden_buffer("あ｜漢字《、》う\n《《あい》》、う", 2, &[]);
+        let warnings = buf.forbidden_line_warnings(buf.goto_line_start(buf.cursor, 0));
+        assert_eq!(warnings.len(), 2);
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.reasons.iter().all(|reason| reason.contains("ルビの母字")))
+        );
+        buf.cursor_move_to_offset("あ｜漢字《、》う\n《《あい》》".len());
+        assert!(buf.forbidden_warning_at_cursor().unwrap().contains("行頭禁則"));
+    }
+
+    #[test]
+    fn selection_latch_requires_both_ctrl_and_shift_in_terminal_input() {
+        use crate::input::{self, kbmod, vk};
+        let mut buf = ruby_buffer("abcdef");
+        for (suffix, arrow) in [('A', vk::UP), ('B', vk::DOWN), ('C', vk::RIGHT), ('D', vk::LEFT)] {
+            // xterm modifiers: none, Shift, Alt, Alt+Shift, Ctrl, Ctrl+Shift,
+            // Ctrl+Alt, and Ctrl+Alt+Shift, respectively.
+            for modifier in 1..=8 {
+                buf.clear_selection();
+                let sequence = format!("\x1b[1;{modifier}{suffix}");
+                let mut vt = crate::vt::Parser::new();
+                let mut parser = input::Parser::new();
+                let mut events = parser.parse(vt.parse(&sequence));
+                let Some(input::Input::Keyboard(key)) = events.next() else {
+                    panic!("failed to decode {sequence:?}");
+                };
+                let mapped = buf.selection_latch_key(key);
+                let starts_latch = matches!(modifier, 6 | 8);
+                assert_eq!(buf.is_selection_latched(), starts_latch, "{sequence:?}");
+                assert!(mapped == Some(if starts_latch { kbmod::SHIFT | arrow } else { key }));
+            }
+        }
+    }
+
+    #[test]
+    fn selection_latch_starts_with_one_step_and_keeps_its_anchor() {
+        use crate::input::{kbmod, vk};
+        let mut buf = ruby_buffer("abcdef");
+        buf.cursor_move_to_logical(Point { x: 3, y: 0 });
+        assert!(
+            buf.selection_latch_key(kbmod::CTRL_SHIFT | vk::RIGHT)
+                == Some(kbmod::SHIFT | vk::RIGHT)
+        );
+        buf.selection_update_delta(CursorMovement::Grapheme, 1);
+        assert_eq!(buf.extract_user_selection(false).unwrap(), b"d");
+        assert!(buf.selection_latch_key(vk::LEFT) == Some(kbmod::SHIFT | vk::LEFT));
+        buf.selection_update_delta(CursorMovement::Grapheme, -1);
+        assert!(!buf.has_selection());
+        assert!(buf.is_selection_latched());
+        buf.selection_update_delta(CursorMovement::Grapheme, -1);
+        assert_eq!(buf.extract_user_selection(false).unwrap(), b"c");
+        buf.selection_latch_key(kbmod::CTRL_SHIFT | vk::RIGHT);
+        buf.selection_update_delta(CursorMovement::Grapheme, 2);
+        assert_eq!(buf.extract_user_selection(false).unwrap(), b"d");
+        assert!(buf.selection_latch_key(vk::HOME) == Some(kbmod::SHIFT | vk::HOME));
+    }
+
+    #[test]
+    fn selection_latch_enter_confirms_and_escape_clears() {
+        use crate::input::vk;
+        let mut buf = ruby_buffer("｜漢字《かんじ》《《圏点》》");
+        buf.start_selection_latch();
+        buf.selection_update_delta(CursorMovement::Grapheme, 2);
+        assert_eq!(buf.extract_user_selection(false).unwrap(), "｜漢字《かんじ》".as_bytes());
+        assert!(buf.selection_latch_key(vk::RETURN).is_none());
+        assert!(!buf.is_selection_latched());
+        assert!(buf.has_selection());
+        assert!(buf.selection_latch_key(vk::RIGHT) == Some(vk::RIGHT));
+        assert_eq!(buffer_contents(&mut buf), "｜漢字《かんじ》《《圏点》》");
+        buf.start_selection_latch();
+        buf.selection_update_delta(CursorMovement::Grapheme, 1);
+        assert!(buf.selection_latch_key(vk::ESCAPE).is_none());
+        assert!(!buf.is_selection_latched());
+        assert!(!buf.has_selection());
+    }
+
+    #[test]
+    fn selection_latch_survives_copy_save_and_unknown_keys() {
+        use crate::input::{kbmod, vk};
+        let mut buf = ruby_buffer("abcdef");
+        buf.start_selection_latch();
+        buf.selection_update_delta(CursorMovement::Grapheme, 2);
+        let mut clipboard = crate::clipboard::Clipboard::default();
+        assert!(buf.selection_latch_key(kbmod::CTRL | vk::C) == Some(kbmod::CTRL | vk::C));
+        buf.copy(&mut clipboard);
+        assert_eq!(clipboard.read(), b"ab");
+        assert!(buf.is_selection_latched());
+        assert!(buf.selection_latch_key(kbmod::CTRL | vk::S) == Some(kbmod::CTRL | vk::S));
+        assert_eq!(buffer_contents(&mut buf), "abcdef");
+        assert!(buf.is_selection_latched());
+        assert!(buf.selection_latch_key(vk::F2) == Some(vk::F2));
+        assert!(buf.is_selection_latched());
+        assert_eq!(buf.extract_user_selection(false).unwrap(), b"ab");
+    }
+
+    #[test]
+    fn selection_latch_finishes_on_edits_and_is_document_local() {
+        let mut buf = ruby_buffer("abcdef");
+        let other = ruby_buffer("other");
+        buf.start_selection_latch();
+        buf.selection_update_delta(CursorMovement::Grapheme, 2);
+        assert!(!other.is_selection_latched());
+        buf.write_canon(b"X");
+        assert!(!buf.is_selection_latched());
+        assert_eq!(buffer_contents(&mut buf), "Xcdef");
+        buf.start_selection_latch();
+        buf.selection_update_delta(CursorMovement::Grapheme, 1);
+        buf.delete(CursorMovement::Grapheme, -1);
+        assert!(!buf.is_selection_latched());
+        assert_eq!(buffer_contents(&mut buf), "Xdef");
+        buf.cursor_move_to_logical(Point::default());
+        buf.start_selection_latch();
+        buf.delete(CursorMovement::Grapheme, -1);
+        assert!(!buf.is_selection_latched());
+    }
+
+    #[test]
+    fn ruby_render_preserves_source_and_colors_only_the_base() {
+        let source = "前｜漢字《かんじ》後";
+        let mut buf = ruby_buffer(source);
+        let mut fb = Framebuffer::new();
+        fb.flip(Size { width: 80, height: 6 });
+        buf.render(
+            Point::default(),
+            Rect { left: 0, top: 0, right: 80, bottom: 6 },
+            false,
+            &mut fb,
+        );
+        let scratch = scratch_arena(None);
+        let rendered = fb.render(&scratch);
+        assert!(rendered.contains("漢字"), "{rendered:?}");
+        assert!(!rendered.contains('｜'));
+        assert!(!rendered.contains('《'));
+        assert!(!rendered.contains("かんじ"));
+        assert_eq!(buffer_contents(&mut buf), source);
+        buf.select_all();
+        assert_eq!(buf.extract_user_selection(false).unwrap(), source.as_bytes());
+    }
+
+    #[test]
+    fn ruby_navigation_skips_markup_and_reports_the_reading() {
+        let mut buf = ruby_buffer("前｜漢字《かんじ》後");
+        assert_eq!(buf.ruby_reading_at_cursor(), None);
+        buf.cursor_move_delta(CursorMovement::Grapheme, 1);
+        assert_eq!(buf.cursor.offset, "前｜".len());
+        assert_eq!(buf.ruby_reading_at_cursor().as_deref(), Some("かんじ"));
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 2, y: 0 });
+        buf.cursor_move_delta(CursorMovement::Grapheme, 1);
+        assert_eq!(buf.cursor.offset, "前｜漢".len());
+        buf.cursor_move_delta(CursorMovement::Grapheme, 1);
+        assert_eq!(buf.cursor.offset, "前｜漢字《かんじ》".len());
+        assert_eq!(buf.ruby_reading_at_cursor(), None);
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 6, y: 0 });
+        buf.cursor_move_delta(CursorMovement::Grapheme, -1);
+        assert_eq!(buf.cursor.offset, "前｜漢".len());
+        assert_eq!(buf.ruby_reading_at_cursor().as_deref(), Some("かんじ"));
+        buf.cursor_move_to_visual(Point { x: 2, y: 0 });
+        assert_eq!(buf.cursor.offset, "前｜".len());
+    }
+
+    #[test]
+    fn ruby_wrap_uses_visible_width_and_incomplete_markup_stays_literal() {
+        let mut buf = ruby_buffer("あ｜漢字《ながいよみがな》いう\n｜未完《よみ");
+        buf.set_wrap_chars(Some(2));
+        buf.set_word_wrap(true);
+        buf.set_width(80);
+        buf.cursor_move_to_offset("あ｜漢字《ながいよみがな》い".len());
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 4, y: 1 });
+        buf.cursor_move_to_offset("あ｜漢字《ながいよみがな》いう\n｜".len());
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 2, y: 3 });
+        assert_eq!(buf.ruby_reading_at_cursor(), None);
+    }
+
+    #[test]
+    fn ruby_cache_updates_when_markup_is_completed_and_undone() {
+        let mut buf = ruby_buffer("｜漢字《かんじ");
+        buf.cursor_move_to_logical(Point::MAX);
+        buf.write_raw("》".as_bytes());
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 4, y: 0 });
+        buf.undo();
+        assert_eq!(buf.cursor_visual_pos().x, 14);
+        buf.redo();
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 4, y: 0 });
+        buf.cursor_move_to_logical(Point::default());
+        assert_eq!(buf.ruby_reading_at_cursor().as_deref(), Some("かんじ"));
+    }
+
+    #[test]
+    fn ruby_partial_deletion_keeps_the_reading_and_undo_restores_source() {
+        let source = "前｜漢字《かんじ》後";
+        let mut buf = ruby_buffer(source);
+        buf.cursor_move_to_visual(Point { x: 6, y: 0 });
+        buf.delete(CursorMovement::Grapheme, -1);
+        assert_eq!(buffer_contents(&mut buf), "前｜漢《かんじ》後");
+        buf.undo();
+        assert_eq!(buffer_contents(&mut buf), source);
+        buf.cursor_move_to_visual(Point { x: 2, y: 0 });
+        buf.delete(CursorMovement::Grapheme, 1);
+        assert_eq!(buffer_contents(&mut buf), "前｜字《かんじ》後");
+
+        let mut buf = ruby_buffer("｜漢《かん》語");
+        buf.delete(CursorMovement::Grapheme, -1);
+        assert_eq!(buffer_contents(&mut buf), "｜漢《かん》語");
+        buf.delete(CursorMovement::Grapheme, 1);
+        assert_eq!(buffer_contents(&mut buf), "語");
+    }
+
+    #[test]
+    fn ruby_selection_copies_complete_markup_and_can_be_replaced() {
+        let source = "前｜漢字《かんじ》後";
+        let mut buf = ruby_buffer(source);
+        buf.cursor_move_to_visual(Point { x: 2, y: 0 });
+        buf.start_selection();
+        buf.selection_update_delta(CursorMovement::Grapheme, 2);
+        assert_eq!(buf.extract_user_selection(false).unwrap(), "｜漢字《かんじ》".as_bytes());
+        buf.write_canon("語".as_bytes());
+        assert_eq!(buffer_contents(&mut buf), "前語後");
+        buf.undo();
+        assert_eq!(buffer_contents(&mut buf), source);
+    }
+
+    #[test]
+    fn emphasis_and_ruby_share_visible_layout_and_switch_messages() {
+        let source = "前《《圏点》》｜漢字《かんじ》後";
+        let mut buf = ruby_buffer(source);
+        buf.set_wrap_chars(Some(2));
+        buf.set_word_wrap(true);
+        buf.set_width(80);
+        assert_eq!(buf.annotation_at_cursor(), None);
+        buf.cursor_move_delta(CursorMovement::Grapheme, 1);
+        assert_eq!(buf.annotation_at_cursor().as_deref(), Some("圏点:[﹅]"));
+        assert_eq!(buf.cursor.offset, "前《《".len());
+        buf.cursor_move_delta(CursorMovement::Grapheme, 2);
+        assert_eq!(buf.annotation_at_cursor().as_deref(), Some("ルビ:[かんじ]"));
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 2, y: 1 });
+        buf.cursor_move_delta(CursorMovement::Grapheme, -1);
+        assert_eq!(buf.annotation_at_cursor().as_deref(), Some("圏点:[﹅]"));
+
+        let mut fb = Framebuffer::new();
+        fb.flip(Size { width: 80, height: 6 });
+        buf.render(
+            Point::default(),
+            Rect { left: 0, top: 0, right: 80, bottom: 6 },
+            false,
+            &mut fb,
+        );
+        let scratch = scratch_arena(None);
+        let rendered = fb.render(&scratch);
+        assert!(rendered.contains("前"));
+        assert!(rendered.contains("圏"));
+        assert!(rendered.contains("点漢"));
+        assert!(!rendered.contains('《'));
+        assert!(!rendered.contains('》'));
+        assert!(!rendered.contains('｜'));
+        assert!(!rendered.contains("かんじ"));
+        assert_eq!(buffer_contents(&mut buf), source);
+    }
+
+    #[test]
+    fn emphasis_selection_and_deletion_preserve_source_markup() {
+        let source = "前《《圏点》》後";
+        let mut buf = ruby_buffer(source);
+        buf.cursor_move_to_visual(Point { x: 6, y: 0 });
+        assert_eq!(buf.annotation_at_cursor(), None);
+        buf.delete(CursorMovement::Grapheme, -1);
+        assert_eq!(buffer_contents(&mut buf), "前《《圏》》後");
+        buf.undo();
+        assert_eq!(buffer_contents(&mut buf), source);
+        buf.cursor_move_to_visual(Point { x: 2, y: 0 });
+        buf.start_selection();
+        buf.selection_update_delta(CursorMovement::Grapheme, 2);
+        assert_eq!(buf.extract_user_selection(false).unwrap(), "《《圏点》》".as_bytes());
+        buf.write_canon("強調".as_bytes());
+        assert_eq!(buffer_contents(&mut buf), "前強調後");
+        buf.undo();
+        assert_eq!(buffer_contents(&mut buf), source);
+    }
+
+    #[test]
+    fn emphasis_completion_and_undo_recalculate_hidden_brackets() {
+        let mut buf = ruby_buffer("《《圏点》");
+        buf.cursor_move_to_logical(Point::MAX);
+        assert_eq!(buf.cursor_visual_pos().x, 10);
+        assert_eq!(buf.annotation_at_cursor(), None);
+        buf.write_raw("》".as_bytes());
+        assert_eq!(buf.cursor_visual_pos().x, 4);
+        buf.undo();
+        assert_eq!(buf.cursor_visual_pos().x, 10);
+        buf.redo();
+        assert_eq!(buf.cursor_visual_pos().x, 4);
+        buf.cursor_move_to_logical(Point::default());
+        assert_eq!(buf.annotation_at_cursor().as_deref(), Some("圏点:[﹅]"));
+    }
+
+    #[test]
+    fn fixed_japanese_wrap_width_and_resize() {
+        let mut buf = TextBuffer::new(false).unwrap();
+        buf.set_crlf(false);
+        buf.write_raw("あいう、え\nかきくけこ".as_bytes());
+        buf.set_wrap_chars(Some(3));
+        buf.set_word_wrap(true);
+        buf.set_width(100);
+
+        // Fixed wrapping leaves punctuation in place for later warning display.
+        buf.cursor_move_to_logical(Point { x: 2, y: 0 });
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 4, y: 0 });
+        buf.cursor_move_to_logical(Point { x: 4, y: 0 });
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 2, y: 1 });
+
+        buf.cursor_move_to_logical(Point { x: 5, y: 0 });
+        buf.set_width(4);
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 2, y: 2 });
+        buf.set_width(100);
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 4, y: 1 });
+
+        buf.set_word_wrap(false);
+        buf.set_width(100);
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 10, y: 0 });
+        buf.set_word_wrap(true);
+        buf.set_width(100);
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 4, y: 1 });
+        assert_eq!(buffer_contents(&mut buf), "あいう、え\nかきくけこ");
+    }
+
+    #[test]
+    fn fixed_japanese_wrap_counts_half_width_and_combining_characters() {
+        let mut buf = TextBuffer::new(false).unwrap();
+        buf.write_raw("あabか\u{3099}いう".as_bytes());
+        buf.set_wrap_chars(Some(3));
+        buf.set_word_wrap(true);
+        buf.set_width(100);
+        buf.cursor_move_to_logical(Point { x: 5, y: 0 });
+        assert_eq!(buf.cursor_visual_pos(), Point { x: 2, y: 1 });
+        assert_eq!(buf.cursor_logical_pos(), Point { x: 5, y: 0 });
     }
 
     #[test]

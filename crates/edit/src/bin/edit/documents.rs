@@ -124,9 +124,21 @@ impl Document {
 #[derive(Default)]
 pub struct DocumentManager {
     list: Vec<Document>,
+    wrap_chars: Option<CoordType>,
 }
 
 impl DocumentManager {
+    pub fn set_wrap_chars(&mut self, wrap_chars: Option<CoordType>) {
+        self.wrap_chars = wrap_chars;
+        for doc in &self.list {
+            let mut tb = doc.buffer.borrow_mut();
+            tb.set_wrap_chars(wrap_chars);
+            if wrap_chars.is_some() {
+                tb.set_word_wrap(true);
+            }
+        }
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.list.len()
@@ -179,7 +191,7 @@ impl DocumentManager {
     }
 
     pub fn add_untitled(&mut self) -> apperr::Result<&mut Document> {
-        let buffer = Self::create_buffer()?;
+        let buffer = self.create_buffer()?;
         let mut doc = Document {
             buffer,
             path: None,
@@ -224,7 +236,7 @@ impl DocumentManager {
             return Ok(doc);
         }
 
-        let buffer = Self::create_buffer()?;
+        let buffer = self.create_buffer()?;
         {
             if let Some(file) = &mut file {
                 let mut tb = buffer.borrow_mut();
@@ -282,13 +294,19 @@ impl DocumentManager {
         File::create(path).map_err(apperr::Error::from)
     }
 
-    fn create_buffer() -> apperr::Result<RcTextBuffer> {
+    fn create_buffer(&self) -> apperr::Result<RcTextBuffer> {
         let buffer = TextBuffer::new_rc(false)?;
         {
             let mut tb = buffer.borrow_mut();
             tb.set_insert_final_newline(!cfg!(windows)); // As mandated by POSIX.
             tb.set_margin_enabled(true);
             tb.set_line_highlight_enabled(true);
+            tb.set_ruby_display(true);
+            tb.set_forbidden_rules(Settings::borrow().forbidden.clone());
+            tb.set_wrap_chars(self.wrap_chars);
+            if self.wrap_chars.is_some() {
+                tb.set_word_wrap(true);
+            }
         }
         Ok(buffer)
     }

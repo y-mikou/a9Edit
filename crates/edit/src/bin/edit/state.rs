@@ -177,10 +177,6 @@ pub struct State {
     pub osc_clipboard_sync: bool,
     pub osc_clipboard_always_send: bool,
     pub exit: bool,
-    // Range selection mode: when true, non-movement/menu inputs are ignored.
-    pub range_select_mode: bool,
-    // Anchor point recorded when entering range selection mode.
-    pub range_select_anchor: Option<Point>,
 }
 
 impl State {
@@ -231,8 +227,6 @@ impl State {
             osc_clipboard_sync: false,
             osc_clipboard_always_send: false,
             exit: false,
-            range_select_mode: false,
-            range_select_anchor: None,
         })
     }
 

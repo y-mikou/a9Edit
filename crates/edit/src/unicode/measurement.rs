@@ -7,6 +7,12 @@ use stdext::unicode::Utf8Chars;
 use super::tables::*;
 use crate::document::ReadableDocument;
 use crate::helpers::{CoordType, Point};
+use std::ops::Range;
+
+/// Source ranges omitted from layout while retaining their original offsets.
+pub trait HiddenText {
+    fn hidden_range(&self, doc: &dyn ReadableDocument, offset: usize) -> Option<Range<usize>>;
+}
 
 // On one hand it's disgusting that I wrote this as a global variable, but on the
 // other hand, this isn't a public library API, and it makes the code a lot cleaner,
@@ -61,13 +67,22 @@ pub struct MeasurementConfig<'doc> {
     cursor: Cursor,
     tab_size: CoordType,
     word_wrap_column: CoordType,
+    wrap_at_any_cluster: bool,
+    hidden_text: Option<&'doc dyn HiddenText>,
     buffer: &'doc dyn ReadableDocument,
 }
 
 impl<'doc> MeasurementConfig<'doc> {
     /// Creates a new [`MeasurementConfig`] for the given document.
     pub fn new(buffer: &'doc dyn ReadableDocument) -> Self {
-        Self { cursor: Default::default(), tab_size: 8, word_wrap_column: 0, buffer }
+        Self {
+            cursor: Default::default(),
+            tab_size: 8,
+            word_wrap_column: 0,
+            wrap_at_any_cluster: false,
+            hidden_text: None,
+            buffer,
+        }
     }
 
     /// Sets the initial cursor to the given position.
@@ -92,6 +107,17 @@ impl<'doc> MeasurementConfig<'doc> {
     /// Defaults to 0, which means no word wrap.
     pub fn with_word_wrap_column(mut self, word_wrap_column: CoordType) -> Self {
         self.word_wrap_column = word_wrap_column;
+        self
+    }
+
+    /// Wrap at grapheme boundaries without moving words or punctuation across the boundary.
+    pub fn with_wrap_at_any_cluster(mut self, enabled: bool) -> Self {
+        self.wrap_at_any_cluster = enabled;
+        self
+    }
+
+    pub fn with_hidden_text(mut self, hidden_text: Option<&'doc dyn HiddenText>) -> Self {
+        self.hidden_text = hidden_text;
         self
     }
 
@@ -247,6 +273,13 @@ impl<'doc> MeasurementConfig<'doc> {
                 width = self.tab_size - (column % self.tab_size);
             }
 
+            let hidden = self
+                .hidden_text
+                .is_some_and(|hidden| hidden.hidden_range(self.buffer, offset).is_some());
+            if hidden {
+                width = 0;
+            }
+
             // Hard wrap: Both the logical and visual position advance by one line.
             if props_last_char == ucd_linefeed_properties() {
                 cold_path();
@@ -332,7 +365,9 @@ impl<'doc> MeasurementConfig<'doc> {
             column += width;
 
             if self.word_wrap_column > 0
-                && !ucd_line_break_joins(props_current_cluster, props_next_cluster)
+                && !hidden
+                && (self.wrap_at_any_cluster
+                    || !ucd_line_break_joins(props_current_cluster, props_next_cluster))
             {
                 wrap_opp = true;
                 wrap_opp_offset = offset;
@@ -360,6 +395,7 @@ impl<'doc> MeasurementConfig<'doc> {
 
                 // The loop below should not modify the target we already found.
                 let mut visual_pos_x_lookahead = visual_pos_x;
+                let mut lookahead_offset = offset;
 
                 loop {
                     let props_current_cluster = props_next_cluster;
@@ -429,6 +465,14 @@ impl<'doc> MeasurementConfig<'doc> {
                         width = self.tab_size - (column % self.tab_size);
                     }
 
+                    let hidden = self.hidden_text.is_some_and(|hidden| {
+                        hidden.hidden_range(self.buffer, lookahead_offset).is_some()
+                    });
+                    if hidden {
+                        width = 0;
+                    }
+                    lookahead_offset = offset_next_cluster;
+
                     // Hard wrap: Both the logical and visual position advance by one line.
                     if props_last_char == ucd_linefeed_properties() {
                         break;
@@ -440,7 +484,9 @@ impl<'doc> MeasurementConfig<'doc> {
                         visual_pos_x -= wrap_opp_visual_pos_x;
                         visual_pos_y += 1;
                         break;
-                    } else if !ucd_line_break_joins(props_current_cluster, props_next_cluster) {
+                    } else if !hidden
+                        && !ucd_line_break_joins(props_current_cluster, props_next_cluster)
+                    {
                         break;
                     }
                 }

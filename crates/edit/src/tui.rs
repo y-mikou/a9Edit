@@ -2406,6 +2406,15 @@ impl<'a> Context<'a, '_> {
         if let Some(input) = &self.input_text {
             write = input.as_bytes();
         } else if let Some(input) = &self.input_keyboard {
+            let input = if single_line {
+                *input
+            } else {
+                let Some(input) = tb.selection_latch_key(*input) else {
+                    self.set_input_consumed();
+                    return true;
+                };
+                input
+            };
             let key = input.key();
             let modifiers = input.modifiers();
 
@@ -2746,7 +2755,7 @@ impl<'a> Context<'a, '_> {
                     _ => return false,
                 },
                 vk::H => match modifiers {
-                    kbmod::CTRL => tb.delete(CursorMovement::Word, -1),
+                    kbmod::CTRL => tb.delete(CursorMovement::Grapheme, -1),
                     _ => return false,
                 },
                 vk::L => match modifiers {
@@ -3290,8 +3299,7 @@ impl<'a> Context<'a, '_> {
             self.attr_foreground_rgba(self.contrasted(self.indexed(IndexedColor::Green)));
         }
 
-        let clicked =
-            self.button_activated()
+        let clicked = self.button_activated()
             || self.consume_shortcut(InputKey::new(accelerator as u32))
             || self.consume_shortcut(kbmod::ALT | InputKey::new(accelerator as u32));
 

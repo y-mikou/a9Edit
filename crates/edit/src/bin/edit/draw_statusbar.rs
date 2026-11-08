@@ -15,6 +15,29 @@ use stdext::collections::BVec;
 use crate::localization::*;
 use crate::state::*;
 
+pub fn draw_messagebar(ctx: &mut Context, state: &State) {
+    let message = state
+        .documents
+        .active()
+        .and_then(|doc| {
+            let tb = doc.buffer.borrow();
+            let warning = tb.forbidden_warning_at_cursor();
+            let annotation = tb.annotation_at_cursor();
+            match (warning, annotation) {
+                (Some(warning), Some(annotation)) => Some(format!("{warning} {annotation}")),
+                (warning, annotation) => warning.or(annotation),
+            }
+        })
+        .unwrap_or_default();
+    ctx.block_begin("messagebar");
+    ctx.attr_intrinsic_size(Size { width: COORD_TYPE_SAFE_MAX, height: 1 });
+    ctx.attr_padding(Rect::two(0, 1));
+    ctx.attr_foreground_rgba(ctx.indexed(IndexedColor::BrightYellow));
+    ctx.label("message", &message);
+    ctx.attr_overflow(Overflow::TruncateTail);
+    ctx.block_end();
+}
+
 pub fn draw_statusbar(ctx: &mut Context, state: &mut State) {
     ctx.table_begin("statusbar");
     ctx.attr_focus_well();
@@ -175,6 +198,10 @@ pub fn draw_statusbar(ctx: &mut Context, state: &mut State) {
         if tb.is_overtype() && ctx.button("overtype", "OVR", ButtonStyle::default()) {
             tb.set_overtype(false);
             ctx.needs_rerender();
+        }
+
+        if tb.is_selection_latched() {
+            ctx.label("selection-latch", "選択ラッチ");
         }
 
         if tb.is_dirty() {

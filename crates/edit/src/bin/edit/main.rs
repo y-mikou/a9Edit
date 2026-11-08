@@ -11,6 +11,7 @@ mod localization;
 mod settings;
 mod state;
 
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::time::Duration;
 use std::{env, process};
@@ -147,99 +148,15 @@ fn run() -> apperr::Result<()> {
                 let raw_input = input_iter.next();
                 let more = raw_input.is_some();
 
-                // Global shortcut: Alt+R toggles range select mode without opening the menu.
-                if let Some(input::Input::Keyboard(k)) = &raw_input {
-                    if *k == (kbmod::ALT | vk::R) {
-                        if let Some(doc) = state.documents.active() {
-                            {
-                                let mut tb = doc.buffer.borrow_mut();
-                                // Toggle the mode and handle anchor/selection the same way as the menu.
-                                state.range_select_mode = !state.range_select_mode;
-                                if state.range_select_mode {
-                                    state.range_select_anchor = Some(tb.cursor_logical_pos());
-                                } else if let Some(anchor) = state.range_select_anchor.take() {
-                                    let current = tb.cursor_logical_pos();
-                                    tb.cursor_move_to_logical(anchor);
-                                    tb.start_selection();
-                                    tb.selection_update_logical(current);
-                                }
-                            }
-                        }
-                        let filtered_input = None;
-                        let mut ctx = tui.create_context(filtered_input);
+                let mut ctx = tui.create_context(raw_input);
+                draw(&mut ctx, &mut state);
 
-                        draw(&mut ctx, &mut state);
-
-                        #[cfg(feature = "debug-latency")]
-                        {
-                            passes += 1;
-                        }
-
-                        more
-                    } else {
-                        // If range selection mode is active, drop any input that is not
-                        // cursor movement, menubar interaction (mouse/enter/space/F10), or resize.
-                        let filtered_input = if state.range_select_mode {
-                            match raw_input {
-                                Some(input::Input::Keyboard(k)) => {
-                                    let key = k.key();
-                                    match key {
-                                        vk::LEFT | vk::RIGHT | vk::UP | vk::DOWN | vk::HOME | vk::END
-                                        | vk::PRIOR | vk::NEXT | vk::RETURN | vk::SPACE | vk::F10
-                                        | vk::ESCAPE => raw_input,
-                                        _ => None,
-                                    }
-                                }
-                                Some(input::Input::Mouse(_)) | Some(input::Input::Resize(_)) => raw_input,
-                                _ => None,
-                            }
-                        } else {
-                            raw_input
-                        };
-
-                        let mut ctx = tui.create_context(filtered_input);
-
-                        draw(&mut ctx, &mut state);
-
-                        #[cfg(feature = "debug-latency")]
-                        {
-                            passes += 1;
-                        }
-
-                        more
-                    }
-                } else {
-                    // If range selection mode is active, drop any input that is not
-                    // cursor movement, menubar interaction (mouse/enter/space/F10), or resize.
-                    let filtered_input = if state.range_select_mode {
-                        match raw_input {
-                            Some(input::Input::Keyboard(k)) => {
-                                let key = k.key();
-                                match key {
-                                    vk::LEFT | vk::RIGHT | vk::UP | vk::DOWN | vk::HOME | vk::END
-                                    | vk::PRIOR | vk::NEXT | vk::RETURN | vk::SPACE | vk::F10
-                                    | vk::ESCAPE => raw_input,
-                                    _ => None,
-                                }
-                            }
-                            Some(input::Input::Mouse(_)) | Some(input::Input::Resize(_)) => raw_input,
-                            _ => None,
-                        }
-                    } else {
-                        raw_input
-                    };
-
-                    let mut ctx = tui.create_context(filtered_input);
-
-                    draw(&mut ctx, &mut state);
-
-                    #[cfg(feature = "debug-latency")]
-                    {
-                        passes += 1;
-                    }
-
-                    more
+                #[cfg(feature = "debug-latency")]
+                {
+                    passes += 1;
                 }
+
+                more
             } {}
         }
 
@@ -322,16 +239,35 @@ fn run() -> apperr::Result<()> {
 
 // Returns true if the application should exit early.
 fn handle_args(state: &mut State) -> apperr::Result<bool> {
+    handle_args_from(state, env::args_os().skip(1))
+}
+
+fn handle_args_from(
+    state: &mut State,
+    args: impl IntoIterator<Item = OsString>,
+) -> apperr::Result<bool> {
     let scratch = scratch_arena(None);
     let mut paths = BVec::empty();
     let cwd = env::current_dir()?;
     let mut dir = None;
     let mut parse_args = true;
     let mut goto_next = false;
+    let mut wrap_chars = None;
 
     // The best CLI argument parser in the world.
-    for arg in env::args_os().skip(1) {
+    for arg in args {
         if parse_args {
+            if arg == "--wrap" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "specify the wrap width without spaces: --wrap=20",
+                )
+                .into());
+            }
+            if let Some(value) = arg.to_str().and_then(|arg| arg.strip_prefix("--wrap=")) {
+                wrap_chars = Some(parse_wrap_chars(OsStr::new(value))?);
+                continue;
+            }
             if arg == "--" {
                 parse_args = false;
                 goto_next = false;
@@ -372,6 +308,8 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
         }
     }
 
+    state.documents.set_wrap_chars(wrap_chars);
+
     for (p, goto) in &paths {
         let doc = state.documents.add_file_path(p)?;
         if let Some(goto) = goto {
@@ -387,6 +325,23 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
 
     state.file_picker_pending_dir = DisplayablePathBuf::from_path(dir.unwrap_or(cwd));
     Ok(false)
+}
+
+fn parse_wrap_chars(value: &OsStr) -> apperr::Result<CoordType> {
+    let count = value.to_str().and_then(|value| {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        value.parse::<CoordType>().ok()
+    });
+    match count {
+        Some(count) if count > 0 && count <= CoordType::MAX / 2 => Ok(count),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("--wrap must be an integer between 1 and {}", CoordType::MAX / 2),
+        )
+        .into()),
+    }
 }
 
 // Read any redirected (piped) stdin into a new document.
@@ -409,6 +364,7 @@ fn print_help() {
     sys::write_stdout(concat!(
         "Usage: edit [OPTIONS] [FILE]...\n",
         "Options:\n",
+        "        --wrap=N                          Wrap at N full-width characters (2 half-width = 1 full-width)\n",
         "    -g, --goto <FILE:LINE[:CHARACTER]>    Open a file at the specified line and character position\n",
         "    -h, --help                            Print this help message\n",
         "    -v, --version                         Print the version number\n",
@@ -423,6 +379,7 @@ fn print_version() {
 fn draw(ctx: &mut Context, state: &mut State) {
     draw_menubar(ctx, state);
     draw_editor(ctx, state);
+    draw_messagebar(ctx, state);
     draw_statusbar(ctx, state);
 
     if state.wants_close {
@@ -786,4 +743,52 @@ fn setup_terminal(tui: &mut Tui, state: &mut State, vt_parser: &mut vt::Parser) 
     }
 
     RestoreModes
+}
+
+#[cfg(test)]
+mod wrap_args_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_positive_wrap_counts_without_overflow() {
+        assert_eq!(parse_wrap_chars(OsStr::new("40")).unwrap(), 40);
+        assert_eq!(parse_wrap_chars(OsStr::new("1")).unwrap(), 1);
+        assert_eq!(
+            parse_wrap_chars(OsStr::new(&(CoordType::MAX / 2).to_string())).unwrap(),
+            CoordType::MAX / 2
+        );
+        for invalid in ["", "0", "-1", "+1", "1.5", "abc", " 40", "999999999999999999999999"] {
+            assert!(parse_wrap_chars(OsStr::new(invalid)).is_err(), "{invalid}");
+        }
+        assert!(parse_wrap_chars(OsStr::new(&CoordType::MAX.to_string())).is_err());
+    }
+
+    #[test]
+    fn parses_wrap_equals_and_rejects_missing_or_separated_values() {
+        {
+            let args = ["--wrap=3"];
+            let mut state = State::new().unwrap();
+            assert!(!handle_args_from(&mut state, args.into_iter().map(OsString::from)).unwrap());
+            let doc = state.documents.add_untitled().unwrap();
+            let mut tb = doc.buffer.borrow_mut();
+            assert!(tb.is_word_wrap_enabled());
+            tb.write_raw("あいうえお".as_bytes());
+            tb.set_width(100);
+            tb.cursor_move_to_logical(Point { x: 4, y: 0 });
+            assert_eq!(tb.cursor_visual_pos(), Point { x: 2, y: 1 });
+        }
+        for args in [vec!["--wrap"], vec!["--wrap="], vec!["--wrap=0"], vec!["--wrap", "20"]] {
+            let mut state = State::new().unwrap();
+            assert!(handle_args_from(&mut state, args.into_iter().map(OsString::from)).is_err());
+        }
+    }
+
+    #[test]
+    fn double_dash_keeps_wrap_option_as_a_filename() {
+        let mut state = State::new().unwrap();
+        handle_args_from(&mut state, ["--", "--wrap=3"].map(OsString::from)).unwrap();
+        let doc = state.documents.active().unwrap();
+        assert_eq!(doc.filename, "--wrap=3");
+        assert!(!doc.buffer.borrow().is_word_wrap_enabled());
+    }
 }
