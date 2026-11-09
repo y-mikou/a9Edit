@@ -97,31 +97,29 @@ Linux では `~/.config/a9Edit/settings.json` を起動時に読み込みます�
 
 禁則設定の例は [settings.example.json](settings.example.json) にあります。新規の設定ファイルをメニューから開く場合も、この内容を雛形にします。
 
-
 ## ビルド
 
-このリポジトリでは `crates/a9Edit` にてリリース用バイナリ `a9Edit` を明示的に定義しています。正式な（最適化された）ビルド手順と基本的なインストール例は以下の通りです。
+Rust 1.93 以上の安定版（stable）が必要です。Debian 環境での Rust と必要なパッケージの導入は、[Rust 導入手順](RUST導入手順.md) を参照してください。
 
-- Release ビルド（ワークスペースのルートで実行）:
-  ```bash
-  cargo build --package a9edit --release --bin a9Edit
-  ```
+リポジトリのルートで、リリースビルドを実行します。`--locked` を指定して、`Cargo.lock` に記録された依存関係を使用します。
 
-- 出力バイナリ:
-  - 成功するとバイナリは `target/release/a9Edit` に作成されます。
+```bash
+cargo build --package a9edit --release --bin a9Edit --locked
+```
 
-- 実行例:
-  ```bash
-  ./target/release/a9Edit <file-to-open>
-  ```
+生成されるバイナリは `target/release/a9Edit` です。
 
-- システムにインストールする例（管理者権限が必要）:
-  ```bash
-  sudo cp target/release/a9Edit /usr/local/bin/a9Edit
-  ```
+```bash
+./target/release/a9Edit <ファイル名>
+```
 
-- ビルド時の環境変数:
-  - ICU の SONAME や組み込む言語の設定は `A9EDIT_CFG_*` 環境変数で指定できます。旧版の `EDIT_CFG_*` は `A9EDIT_CFG_*` に変更しています。必要に応じて `A9EDIT_CFG_ICUUC_SONAME` や `A9EDIT_CFG_ICUI18N_SONAME` を設定してビルドしてください。
+システムにインストールする例（管理者権限が必要）:
+
+```bash
+sudo cp target/release/a9Edit /usr/local/bin/a9Edit
+```
+
+ビルド時の ICU の SONAME や組み込む言語の設定は `A9EDIT_CFG_*` 環境変数で指定できます。旧版の `EDIT_CFG_*` は `A9EDIT_CFG_*` に変更しています。必要に応じて `A9EDIT_CFG_ICUUC_SONAME` や `A9EDIT_CFG_ICUI18N_SONAME` を設定してビルドしてください。
 
 注: `crates/a9Edit/Cargo.toml` で `autobins = false` を設定しているため、`a9Edit` を明示的に `--bin` 指定してビルドするか、上記のコマンドを使用してください。
 
