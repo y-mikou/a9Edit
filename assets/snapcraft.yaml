@@ -1,9 +1,11 @@
-name: msedit
+name: a9edit
 base: core24
 version: "2.0.0"
-summary: Edit is an MS-DOS inspired text editor from Microsoft
+title: a9Edit
+summary: A text editor with Japanese writing support
 description: |
-  Edit pays homage to the classic MS-DOS Editor, but with a modern interface and input controls similar to VS Code. Learn more at https://github.com/microsoft/edit
+  a9Edit is based on Microsoft Edit and adds selection latching, Japanese
+  character wrapping, ruby and emphasis display, and line-breaking warnings.
 
   Disclaimer: This is an unofficial Snap and it is not endorsed by nor affiliated officially with Microsoft Corporation.
 
@@ -11,15 +13,14 @@ grade: stable
 confinement: strict
 
 apps:
-  msedit:
-    command: bin/edit
+  a9edit:
+    command: bin/a9Edit
     plugs:
       - home
 
 parts:
-  edit:
-    source: https://github.com/microsoft/edit.git
-    source-type: git
+  a9edit:
+    source: .
     plugin: rust
     build-packages:
       - build-essential

@@ -1,8 +1,16 @@
 name: Submit release to the WinGet community repository
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      package-id:
+        description: Registered WinGet package identifier for a9Edit
+        required: true
+        type: string
+      tag:
+        description: Published release tag (e.g. v2.0.0)
+        required: true
+        type: string
 
 jobs:
   publish-winget:
@@ -14,22 +22,26 @@ jobs:
     # winget-create will read the following environment variable to access the GitHub token needed for submitting a PR
     # See https://aka.ms/winget-create-token
     env:
+      GH_TOKEN: ${{ github.token }}
+      A9EDIT_WINGET_PACKAGE_ID: ${{ inputs.package-id }}
+      A9EDIT_RELEASE_TAG: ${{ inputs.tag }}
+      GH_REPO: ${{ github.repository }}
       WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
 
-    # Only submit stable releases
-    if: ${{ !github.event.release.prerelease }}
     steps:
       - name: Submit package using wingetcreate
         run: |
-          # Get installer info from release event
-          $assets = '${{ toJSON(github.event.release.assets) }}' | ConvertFrom-Json
-          $x64InstallerUrl = $assets | Where-Object -Property name -like '*x86_64-windows.zip' | Select-Object -ExpandProperty browser_download_url
-          $arm64InstallerUrl = $assets | Where-Object -Property name -like '*aarch64-windows.zip' | Select-Object -ExpandProperty browser_download_url
-          $packageVersion = (${{ toJSON(github.event.release.tag_name) }}).Trim('v')
+          # Get installer info from the selected a9Edit release
+          $release = gh release view $env:A9EDIT_RELEASE_TAG --json assets,isPrerelease,tagName | ConvertFrom-Json
+          if ($release.isPrerelease) { throw "Only stable releases can be submitted." }
+          $assets = $release.assets
+          $x64InstallerUrl = $assets | Where-Object -Property name -like '*x86_64-windows.zip' | Select-Object -ExpandProperty url
+          $arm64InstallerUrl = $assets | Where-Object -Property name -like '*aarch64-windows.zip' | Select-Object -ExpandProperty url
+          $packageVersion = $release.tagName.TrimStart('v')
 
           # Update package using wingetcreate
           curl.exe -JLO https://aka.ms/wingetcreate/latest
-          .\wingetcreate.exe update Microsoft.Edit `
+          .\wingetcreate.exe update $env:A9EDIT_WINGET_PACKAGE_ID `
             --version $packageVersion `
             --urls $x64InstallerUrl $arm64InstallerUrl `
             --submit

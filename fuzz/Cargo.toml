@@ -1,5 +1,5 @@
 [package]
-name = "edit-fuzz"
+name = "a9edit-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -10,7 +10,7 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
-edit = { path = "../crates/edit" }
+a9edit = { path = "../crates/a9Edit" }
 stdext = { path = "../crates/stdext" }
 libfuzzer-sys = "0.4"
 

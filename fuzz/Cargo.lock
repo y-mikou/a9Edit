@@ -3,6 +3,27 @@
 version = 4
 
 [[package]]
+name = "a9edit"
+version = "2.0.0"
+dependencies = [
+ "libc",
+ "lsh",
+ "stdext",
+ "toml-span",
+ "windows-sys",
+ "winresource",
+]
+
+[[package]]
+name = "a9edit-fuzz"
+version = "0.0.0"
+dependencies = [
+ "a9edit",
+ "libfuzzer-sys",
+ "stdext",
+]
+
+[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -25,27 +46,6 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
-
-[[package]]
-name = "edit"
-version = "1.2.1"
-dependencies = [
- "libc",
- "lsh",
- "stdext",
- "toml-span",
- "windows-sys",
- "winresource",
-]
-
-[[package]]
-name = "edit-fuzz"
-version = "0.0.0"
-dependencies = [
- "edit",
- "libfuzzer-sys",
- "stdext",
-]
 
 [[package]]
 name = "find-msvc-tools"
@@ -125,9 +125,9 @@ dependencies = [
 
 [[package]]
 name = "toml-span"
-version = "0.6.0"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c6532e5b62b652073bff0e2050ef57e4697a853be118d6c57c32b59fffdeaab"
+checksum = "ac7807845e399906fbe4e7f57369d284d5bf102836423073290b7c01948dbda3"
 dependencies = [
  "smallvec",
 ]

@@ -1,6 +1,6 @@
 # lsh
 
-`lsh` contains the compiler and runtime for Edit's syntax-highlighting system.
+`lsh` contains the compiler and runtime for a9Edit's syntax-highlighting system.
 
 At a high level:
 * Language definitions live in `definitions/*.lsh`

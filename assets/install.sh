@@ -127,37 +127,37 @@ esac
 
 if [ "$dev" = 1 ]; then
     log "Downloading main branch"
-    download "$tmpdir/edit.tar.gz" 'https://github.com/microsoft/edit/archive/refs/heads/main.tar.gz'
+    download "$tmpdir/a9Edit.tar.gz" 'https://github.com/y-mikou/edit_add-select-mode/archive/refs/heads/main.tar.gz'
 else
     log "Fetching latest release tag"
-    download "$tmpdir/latest.json" 'https://api.github.com/repos/microsoft/edit/releases/latest'
+    download "$tmpdir/latest.json" 'https://api.github.com/repos/y-mikou/edit_add-select-mode/releases/latest'
     tag=$(grep -oE '"tag_name": *"[^"]+"' "$tmpdir/latest.json" | grep -oE 'v[^"]+')
     [ -n "$tag" ] || die "Could not determine latest release tag."
     log "Latest release: $tag"
-    download "$tmpdir/edit.tar.gz" "https://github.com/microsoft/edit/archive/refs/tags/$tag.tar.gz"
+    download "$tmpdir/a9Edit.tar.gz" "https://github.com/y-mikou/edit_add-select-mode/archive/refs/tags/$tag.tar.gz"
 fi
 
-srcdir="$tmpdir/edit-src"
+srcdir="$tmpdir/a9Edit-src"
 mkdir -p "$srcdir"
 log "Extracting"
-tar xf "$tmpdir/edit.tar.gz" -C "$srcdir" --strip-components=1
+tar xf "$tmpdir/a9Edit.tar.gz" -C "$srcdir" --strip-components=1
 
 #### Build
 
 log "Building"
-[ -z "$icuuc_soname" ] || export EDIT_CFG_ICUUC_SONAME="$icuuc_soname"
-[ -z "$icui18n_soname" ] || export EDIT_CFG_ICUI18N_SONAME="$icui18n_soname"
-[ -z "$icu_cpp_exports" ] || export EDIT_CFG_ICU_CPP_EXPORTS="$icu_cpp_exports"
-[ -z "$icu_renaming_version" ] || export EDIT_CFG_ICU_RENAMING_VERSION="$icu_renaming_version"
+[ -z "$icuuc_soname" ] || export A9EDIT_CFG_ICUUC_SONAME="$icuuc_soname"
+[ -z "$icui18n_soname" ] || export A9EDIT_CFG_ICUI18N_SONAME="$icui18n_soname"
+[ -z "$icu_cpp_exports" ] || export A9EDIT_CFG_ICU_CPP_EXPORTS="$icu_cpp_exports"
+[ -z "$icu_renaming_version" ] || export A9EDIT_CFG_ICU_RENAMING_VERSION="$icu_renaming_version"
 
 if rustup component list --installed 2>/dev/null | grep -q rust-src; then
-    (cd "$srcdir" && RUSTC_BOOTSTRAP=1 cargo build -p edit --release --config .cargo/release.toml)
+    (cd "$srcdir" && RUSTC_BOOTSTRAP=1 cargo build -p a9edit --bin a9Edit --release --config .cargo/release.toml)
 else
     warn "rust-src component not found; building without size optimizations"
-    (cd "$srcdir" && cargo build -p edit --release)
+    (cd "$srcdir" && cargo build -p a9edit --bin a9Edit --release)
 fi
 
-bin="$srcdir/target/release/edit"
+bin="$srcdir/target/release/a9Edit"
 [ -x "$bin" ] || die "Build failed: binary not found."
 
 #### Install
@@ -172,31 +172,17 @@ fi
 
 log "Installing to $dest"
 $run mkdir -p "$dest"
-$run cp "$bin" "$dest/msedit"
-$run chmod 755 "$dest/msedit"
-if [ ! -e "$dest/edit" ] || [ "$(readlink "$dest/edit" 2>/dev/null)" = "msedit" ]; then
-    $run ln -sf msedit "$dest/edit"
-    edit_linked=1
-else
-    edit_linked=0
-fi
+$run cp "$bin" "$dest/a9Edit"
+$run chmod 755 "$dest/a9Edit"
 
 #### Summary
 
 case ":$PATH:" in
     *":$dest:"*)
-        if [ "$edit_linked" = 1 ]; then
-            echo "✅ Done. Run 'edit' or 'msedit' to start."
-        else
-            echo "✅ Done. Run 'msedit' to start."
-        fi
+        echo "✅ Done. Run 'a9Edit' to start."
         ;;
     *)
         echo "⚠️ Done. $dest is not in PATH; you may need to add it."
-        if [ "$edit_linked" = 1 ]; then
-            echo "Run '$dest/edit' or '$dest/msedit' to start."
-        else
-            echo "Run '$dest/msedit' to start."
-        fi
+        echo "Run '$dest/a9Edit' to start."
         ;;
 esac

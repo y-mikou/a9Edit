@@ -53,7 +53,7 @@ extends:
         Network: R1
     platform:
       name: windows_undocked
-      product: edit
+      product: a9Edit
     # https://aka.ms/obpipelines/cloudvault
     cloudvault:
       enabled: false
@@ -83,21 +83,21 @@ extends:
               # It will have a structure like:
               # .../vpack/
               #      - amd64/
-              #         - edit.exe
+              #         - a9Edit.exe
               #      - i386/
-              #         - edit.exe
+              #         - a9Edit.exe
               #      - arm64/
-              #         - edit.exe
+              #         - a9Edit.exe
               ob_createvpack_enabled: ${{parameters.createvpack}}
               ob_createvpack_vpackdirectory: "$(ob_outputDirectory)/vpack"
-              ob_createvpack_packagename: "windows_edit.$(Build.SourceBranchName)"
+              ob_createvpack_packagename: "windows_a9Edit.$(Build.SourceBranchName)"
               ob_createvpack_owneralias: lhecker@microsoft.com
-              ob_createvpack_description: Microsoft Edit
+              ob_createvpack_description: a9Edit
               ob_createvpack_targetDestinationDirectory: "$(Destination)"
               ob_createvpack_propsFile: false
               ob_createvpack_provData: true
               ob_createvpack_versionAs: string
-              ob_createvpack_version: "$(EditVersion)-$(CDP_DEFINITION_BUILD_COUNT)"
+              ob_createvpack_version: "$(A9EditVersion)-$(CDP_DEFINITION_BUILD_COUNT)"
               ob_createvpack_metadata: "$(Build.SourceVersion)"
               ob_createvpack_topLevelRetries: 0
               ob_createvpack_failOnStdErr: true
@@ -152,17 +152,17 @@ extends:
               # Extract the version for `ob_createvpack_version`.
               - script: |-
                   @echo off
-                  for /f "tokens=3 delims=- " %%x in ('findstr /c:"version = " crates\edit\Cargo.toml') do (
-                      echo ##vso[task.setvariable variable=EditVersion]%%~x
+                  for /f "tokens=3 delims=- " %%x in ('findstr /c:"version = " crates\a9Edit\Cargo.toml') do (
+                      echo ##vso[task.setvariable variable=A9EditVersion]%%~x
                       goto :EOF
                   )
-                displayName: "Set EditVersion"
+                displayName: "Set A9EditVersion"
               - task: onebranch.pipeline.signing@1
                 displayName: "Sign files"
                 inputs:
                   command: "sign"
                   signing_profile: "external_distribution"
-                  files_to_sign: "**/edit.exe"
+                  files_to_sign: "**/a9Edit.exe"
                   search_root: "$(ob_createvpack_vpackdirectory)"
                   use_testsign: false
                   in_container: true
@@ -174,7 +174,7 @@ extends:
                     Get-ChildItem "${env:VPACK_ROOT}\*" -Include *.exe, *.pdb | Copy-Item -Destination $Dest -Verbose
                     tar.exe -c -v --format=zip -f "$(ob_outputDirectory)\${env:RELEASE_NAME}.zip" -C _staging $env:RELEASE_NAME
                   env:
-                    RELEASE_NAME: edit-$(EditVersion)-${{ replace(platform, 'pc-windows-msvc', 'windows') }}
+                    RELEASE_NAME: a9Edit-$(A9EditVersion)-${{ replace(platform, 'pc-windows-msvc', 'windows') }}
                     ${{ if eq(platform, 'i686-pc-windows-msvc') }}:
                       VPACK_ROOT: "$(ob_createvpack_vpackdirectory)/i386"
                     ${{ elseif eq(platform, 'x86_64-pc-windows-msvc') }}:

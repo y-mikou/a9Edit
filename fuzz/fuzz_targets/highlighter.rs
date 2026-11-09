@@ -1,6 +1,6 @@
 #![no_main]
 
-use edit::lsh::{Highlighter, LANGUAGES};
+use a9edit::lsh::{Highlighter, LANGUAGES};
 use libfuzzer_sys::fuzz_target;
 use stdext::arena::scratch_arena;
 

@@ -40,7 +40,7 @@ cargo --version
 ```bash
 rustup toolchain install stable --profile minimal
 
-cd /home/youmikou/git/edit_r-sel
+cd /home/youmikou/git/a9Edit
 rustup override set stable
 ```
 
@@ -53,13 +53,13 @@ rustup override set stable
 リポジトリのルートで実行します。
 
 ```bash
-cargo build --package edit --release --bin edit_r-sel --locked
+cargo build --package a9edit --release --bin a9Edit --locked
 ```
 
-生成されるバイナリは `target/release/edit_r-sel` です。
+生成されるバイナリは `target/release/a9Edit` です。
 
 ```bash
-./target/release/edit_r-sel <ファイル名>
+./target/release/a9Edit <ファイル名>
 ```
 
 以降のビルドでは、検証時に使用した `/tmp` の Rust や、一時的な `CARGO_HOME`・`RUSTUP_HOME` の指定は不要です。

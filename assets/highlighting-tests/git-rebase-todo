@@ -10,7 +10,7 @@ fixup -c 2f4e8ab feat(cli): adjust arg parsing error message
 pick 6d8e5f1 refactor(core): split large module into submodules
 break
 pick a41e9d3 test(core): add regression tests for issue #410
-exec cargo test --package edit --lib --quiet
+exec cargo test --package a9edit --lib --quiet
 pick c3bb921 perf(render): SIMD accelerate line diffing
 drop 91d0f2e debug(render): temporary logging (to be dropped)
 label pre-merge-split

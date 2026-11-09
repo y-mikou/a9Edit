@@ -1,12 +1,12 @@
 [workspace]
-default-members = ["crates/edit"]
+default-members = ["crates/a9Edit"]
 members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/microsoft/edit"
+repository = "https://github.com/y-mikou/edit_add-select-mode"
 rust-version = "1.93"
 
 # We use `opt-level = "s"` as it significantly reduces binary size.
@@ -27,7 +27,7 @@ codegen-units = 16          # Make compiling criterion faster (16 is the default
 lto = "thin"                # Similarly, speed up linking by a ton
 
 [workspace.dependencies]
-edit = { path = "./crates/edit" }
+a9edit = { path = "./crates/a9Edit" }
 lsh = { path = "./crates/lsh" }
 stdext = { path = "./crates/stdext" }
 unicode-gen = { path = "./crates/unicode-gen" }

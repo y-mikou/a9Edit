@@ -2,25 +2,25 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Launch edit (Windows)",
+            "name": "Launch a9Edit (Windows)",
             "preLaunchTask": "rust: cargo build",
             "type": "cppvsdbg",
             "request": "launch",
             "console": "externalTerminal",
-            "program": "${workspaceFolder}/target/debug/edit",
+            "program": "${workspaceFolder}/target/debug/a9Edit.exe",
             "cwd": "${workspaceFolder}",
             "args": [
                 "${workspaceFolder}/assets/highlighting-tests/markdown.md"
             ],
         },
         {
-            "name": "Launch edit (GDB, Linux)",
+            "name": "Launch a9Edit (GDB, Linux)",
             "preLaunchTask": "rust: cargo build",
             "type": "cppdbg",
             "request": "launch",
             "miDebuggerPath": "rust-gdb",
             "externalConsole": true,
-            "program": "${workspaceFolder}/target/debug/edit",
+            "program": "${workspaceFolder}/target/debug/a9Edit",
             "cwd": "${workspaceFolder}",
             "args": [
                 "${workspaceFolder}/assets/highlighting-tests/markdown.md"
@@ -35,11 +35,11 @@
             //    }
             // 3. Add the following to your ~/.lldbinit file (replace "stable" with "nightly" if needed):
             //    command script import ~/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/etc/lldb_lookup.py
-            "name": "Launch edit (lldb-dap, macOS)",
+            "name": "Launch a9Edit (lldb-dap, macOS)",
             "preLaunchTask": "rust: cargo build",
             "type": "lldb-dap",
             "request": "launch",
-            "program": "${workspaceFolder}/target/debug/edit",
+            "program": "${workspaceFolder}/target/debug/a9Edit",
             "cwd": "${workspaceFolder}",
             "args": [
                 "${workspaceFolder}/assets/highlighting-tests/markdown.md"

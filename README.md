@@ -1,4 +1,8 @@
-# Edit(範囲選択モード追加)
+# a9Edit
+
+読みは「阿求（あきゅう）エディット」です。
+
+a9Edit は、範囲選択ラッチ・日本語文字数での折り返し・ルビや圏点の表示・禁則候補の警告を備えたテキストエディタです。
 
 基本機能は本家のEdit(https://github.com/microsoft/edit) に準拠します。
 
@@ -27,7 +31,7 @@
 起動時に `--wrap=N` を指定すると、日本語（全角）`N` 文字分の幅で表示を折り返します。半角文字2文字を日本語1文字分として数えます。引数と値の間にスペースは挟みません。
 
 ```bash
-./target/release/edit_r-sel --wrap=20 文書.txt
+./target/release/a9Edit --wrap=20 文書.txt
 ```
 
 - 全角文字を2桁、半角英数字を1桁として数えます。`--wrap=20` は全角20文字分（半角40文字分）です。結合文字は端末上の表示幅に従います。タブは設定されたタブ幅で計算します。
@@ -54,7 +58,9 @@
 
 ## 禁則候補の警告表示と設定ファイル
 
-Linux では `~/.config/msedit/settings.json` を起動時に読み込みます。`XDG_CONFIG_HOME` を設定している場合は、その配下の `msedit/settings.json` を使用します。`File` → `Preferences` からも編集できます。変更の反映には再起動してください。
+設定保存先は Windows では `%APPDATA%\a9Edit\settings.json`、macOS では `~/Library/Application Support/a9Edit/settings.json` です。旧版の設定を引き継ぐ場合は、従来の保存先から新しい保存先へ `settings.json` をコピーしてください。
+
+Linux では `~/.config/a9Edit/settings.json` を起動時に読み込みます。`XDG_CONFIG_HOME` を設定している場合は、その配下の `a9Edit/settings.json` を使用します。`File` → `Preferences` からも編集できます。変更の反映には再起動してください。
 
 既存の JSON に、次の `forbidden` オブジェクトを追加します。既存の `files.associations` などは同じ階層に残せます。
 
@@ -84,27 +90,29 @@ Linux では `~/.config/msedit/settings.json` を起動時に読み込みます�
 
 ## ビルド
 
-このリポジトリでは `crates/edit` にてリリース用バイナリ `edit_r-sel` を明示的に定義しています。正式な（最適化された）ビルド手順と基本的なインストール例は以下の通りです。
+このリポジトリでは `crates/a9Edit` にてリリース用バイナリ `a9Edit` を明示的に定義しています。正式な（最適化された）ビルド手順と基本的なインストール例は以下の通りです。
 
 - Release ビルド（ワークスペースのルートで実行）:
   ```bash
-  cargo build --package edit --release --bin edit_r-sel
+  cargo build --package a9edit --release --bin a9Edit
   ```
 
 - 出力バイナリ:
-  - 成功するとバイナリは `target/release/edit_r-sel` に作成されます。
+  - 成功するとバイナリは `target/release/a9Edit` に作成されます。
 
 - 実行例:
   ```bash
-  ./target/release/edit_r-sel <file-to-open>
+  ./target/release/a9Edit <file-to-open>
   ```
 
 - システムにインストールする例（管理者権限が必要）:
   ```bash
-  sudo cp target/release/edit_r-sel /usr/local/bin/edit_r-sel
+  sudo cp target/release/a9Edit /usr/local/bin/a9Edit
   ```
 
 - ビルド時の環境変数:
-  - ICU の SONAME や組み込む言語の設定は既存の `Build Configuration` セクションで触れている `EDIT_CFG_*` 環境変数を参照してください。必要に応じて `EDIT_CFG_ICUUC_SONAME` や `EDIT_CFG_ICUI18N_SONAME` を設定してビルドしてください。
+  - ICU の SONAME や組み込む言語の設定は `A9EDIT_CFG_*` 環境変数で指定できます。旧版の `EDIT_CFG_*` は `A9EDIT_CFG_*` に変更しています。必要に応じて `A9EDIT_CFG_ICUUC_SONAME` や `A9EDIT_CFG_ICUI18N_SONAME` を設定してビルドしてください。
 
-注: `crates/edit/Cargo.toml` で `autobins = false` を設定しているため、`edit_r-sel` を明示的に `--bin` 指定してビルドするか、上記のコマンドを使用してください。
+注: `crates/a9Edit/Cargo.toml` で `autobins = false` を設定しているため、`a9Edit` を明示的に `--bin` 指定してビルドするか、上記のコマンドを使用してください。
+
+配布用の WinGet ワークフローは手動実行です。a9Edit 用に登録済みのパッケージ ID と公開済みのリリースタグを指定してください。
