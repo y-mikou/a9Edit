@@ -131,6 +131,8 @@ struct HistoryEntry {
     deleted: Vec<u8>,
     /// Text that was added to the buffer.
     added: Vec<u8>,
+    /// Soft wrap boundaries saved while editing visible formatting source.
+    format_wraps_before: Option<Vec<usize>>,
 }
 
 /// Caches an ICU search operation.
@@ -232,6 +234,36 @@ pub type TextBufferCell = SemiRefCell<TextBuffer>;
 pub type RcTextBuffer = Rc<TextBufferCell>;
 
 /// A text buffer for a text editor.
+struct FormatEdit {
+    source: Range<usize>,
+    wraps: Vec<usize>,
+    wrap_column: CoordType,
+    undo_floor: usize,
+    undone: usize,
+}
+
+impl FormatEdit {
+    fn replace(&mut self, replaced: Range<usize>, added: usize) {
+        let adjust = |offset: usize| {
+            if offset < replaced.start {
+                offset
+            } else if offset <= replaced.end {
+                replaced.start + added
+            } else {
+                offset - replaced.len() + added
+            }
+        };
+        self.source.end = adjust(self.source.end);
+        for offset in &mut self.wraps {
+            if *offset != replaced.start {
+                *offset = adjust(*offset);
+            }
+        }
+        self.wraps.retain(|&offset| offset > self.source.start && offset < self.source.end);
+        self.wraps.dedup();
+    }
+}
+
 pub struct TextBuffer {
     buffer: GapBuffer,
 
@@ -259,6 +291,7 @@ pub struct TextBuffer {
     highlighter_cache: HighlighterCache,
     ruby_cache: ruby::RubyCache,
     ruby_display: bool,
+    format_edit: Option<FormatEdit>,
     forbidden_rules: Option<Rc<ForbiddenRules>>,
     warning_cache: std::cell::RefCell<forbidden::WarningCache>,
 
@@ -315,6 +348,7 @@ impl TextBuffer {
             highlighter_cache: HighlighterCache::new(),
             ruby_cache: ruby::RubyCache::default(),
             ruby_display: false,
+            format_edit: None,
             forbidden_rules: None,
             warning_cache: Default::default(),
 
@@ -405,6 +439,9 @@ impl TextBuffer {
     ///
     /// NOTE: Cannot be undone.
     pub fn normalize_newlines(&mut self, crlf: bool) {
+        if self.is_format_editing() {
+            return;
+        }
         let newline: &[u8] = if crlf { b"\r\n" } else { b"\n" };
         let mut off = 0;
 
@@ -547,6 +584,9 @@ impl TextBuffer {
     /// NOTE: It's expected that the tui code calls `set_width()` sometime after this.
     /// This will then trigger the actual recalculation of the cursor position.
     pub fn set_word_wrap(&mut self, enabled: bool) {
+        if self.is_format_editing() {
+            return;
+        }
         if self.word_wrap_enabled != enabled {
             self.word_wrap_enabled = enabled;
             self.width = 0; // Force a reflow.
@@ -572,6 +612,9 @@ impl TextBuffer {
 
     /// Show ruby/emphasis bases, preserving the original markup for editing and saving.
     pub fn set_ruby_display(&mut self, enabled: bool) {
+        if !enabled && self.is_format_editing() {
+            self.toggle_format_editing();
+        }
         if self.ruby_display != enabled {
             self.ruby_display = enabled;
             self.reflow();
@@ -582,6 +625,80 @@ impl TextBuffer {
     fn ruby_line(&self, offset: usize) -> Rc<ruby::Line> {
         self.ruby_cache.prepare(self.buffer.generation());
         self.ruby_cache.line(&self.buffer, offset)
+    }
+
+    pub fn is_format_editing(&self) -> bool {
+        self.format_edit.is_some()
+    }
+
+    /// Toggle source editing for the annotated logical line under the caret.
+    pub fn toggle_format_editing(&mut self) -> bool {
+        if self.format_edit.is_some() {
+            self.format_edit = None;
+            self.search = None;
+            self.clear_selection();
+            self.last_history_type = HistoryType::Other;
+            self.reflow();
+            self.cursor = self.skip_hidden_ruby(self.cursor, 1);
+            self.make_cursor_visible();
+            return true;
+        }
+        if !self.ruby_display
+            || !self
+                .ruby_line(self.cursor.offset)
+                .ruby
+                .iter()
+                .any(|ruby| (ruby.markup.start..ruby.base.end).contains(&self.cursor.offset))
+        {
+            return false;
+        }
+        let start = self.goto_line_start(self.cursor, self.cursor.logical_pos.y);
+        let end = self.cursor_move_to_logical_internal(
+            start,
+            Point { x: CoordType::MAX, y: start.logical_pos.y },
+        );
+        let mut wraps = Vec::new();
+        for y in start.visual_pos.y + 1..=end.visual_pos.y {
+            let row = self.cursor_move_to_visual_internal(start, Point { x: 0, y });
+            if row.offset > start.offset && row.offset < end.offset {
+                wraps.push(self.ruby_insertion_cursor(row).offset);
+            }
+        }
+        self.clear_selection();
+        self.search = None;
+        self.last_history_type = HistoryType::Other;
+        self.format_edit = Some(FormatEdit {
+            source: start.offset..end.offset,
+            wraps,
+            wrap_column: self.word_wrap_column,
+            undo_floor: self.undo_stack.len(),
+            undone: 0,
+        });
+        self.reflow();
+        self.make_cursor_visible();
+        true
+    }
+
+    fn source_is_visible(&self, offset: usize) -> bool {
+        self.format_edit
+            .as_ref()
+            .is_some_and(|edit| edit.source.start <= offset && offset <= edit.source.end)
+    }
+
+    fn constrain_format_cursor(&self, cursor: Cursor) -> Cursor {
+        if let Some(edit) = &self.format_edit {
+            let offset = cursor.offset.clamp(edit.source.start, edit.source.end);
+            if offset != cursor.offset {
+                return self.cursor_move_to_offset_internal(self.cursor, offset);
+            }
+        }
+        cursor
+    }
+
+    fn update_format_offsets(&mut self, replaced: Range<usize>, added: usize) {
+        if let Some(edit) = &mut self.format_edit {
+            edit.replace(replaced, added);
+        }
     }
 
     /// Reading of the ruby base at the caret, if any.
@@ -692,16 +809,37 @@ impl TextBuffer {
     }
 
     fn hidden_ruby_range(&self, offset: usize) -> Option<Range<usize>> {
-        if !self.ruby_display {
+        if !self.ruby_display || self.source_is_visible(offset) {
             return None;
         }
         self.ruby_cache.prepare(self.buffer.generation());
         self.ruby_cache.hidden_range(&self.buffer, offset)
     }
 
+    // A caret at the edge of a collapsed annotation inserts outside its markup.
+    // Keep navigation/selection offsets unchanged so partial base edits still work.
+    fn ruby_insertion_cursor(&self, cursor: Cursor) -> Cursor {
+        if self.ruby_display && !self.source_is_visible(cursor.offset) {
+            for ruby in &self.ruby_line(cursor.offset).ruby {
+                let offset = if (ruby.markup.start..=ruby.base.start).contains(&cursor.offset) {
+                    ruby.markup.start
+                } else if (ruby.base.end..ruby.markup.end).contains(&cursor.offset) {
+                    ruby.markup.end
+                } else {
+                    continue;
+                };
+                return self.cursor_move_to_offset_internal(cursor, offset);
+            }
+        }
+        cursor
+    }
+
     // Keep delimiters/readings intact when editing part of a base. Selecting the
     // whole base includes its complete source markup for copy, replacement and deletion.
     fn ruby_source_range(&self, beg: Cursor, end: Cursor) -> (Cursor, Cursor) {
+        if self.is_format_editing() {
+            return (self.constrain_format_cursor(beg), self.constrain_format_cursor(end));
+        }
         if !self.ruby_display {
             return (beg, end);
         }
@@ -846,7 +984,9 @@ impl TextBuffer {
 
             let text_width = self.text_width();
             // 2 columns are required, because otherwise wide glyphs wouldn't ever fit.
-            self.word_wrap_column = if self.word_wrap_enabled && text_width >= 2 {
+            self.word_wrap_column = if let Some(edit) = &self.format_edit {
+                edit.wrap_column
+            } else if self.word_wrap_enabled && text_width >= 2 {
                 self.wrap_chars.map_or(text_width, |count| (count * 2).min(text_width))
             } else {
                 0
@@ -1276,6 +1416,16 @@ impl TextBuffer {
     }
 
     fn set_selection(&mut self, selection: Option<TextBufferSelection>) -> u32 {
+        let selection = selection.map(|s| {
+            if !self.is_format_editing() {
+                return s;
+            }
+            let beg = self
+                .constrain_format_cursor(self.cursor_move_to_logical_internal(self.cursor, s.beg));
+            let end = self
+                .constrain_format_cursor(self.cursor_move_to_logical_internal(self.cursor, s.end));
+            TextBufferSelection { beg: beg.logical_pos, end: end.logical_pos }
+        });
         self.selection = selection.filter(|s| s.beg != s.end);
         self.selection_generation = self.selection_generation.wrapping_add(1);
         self.selection_generation
@@ -1433,6 +1583,11 @@ impl TextBuffer {
                     Self::find_parse_replacement(&scratch, &mut *search, replacement);
                 let replacement =
                     self.find_fill_replacement(&mut *search, replacement, &parsed_replacements);
+                if self.is_format_editing()
+                    && replacement.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
+                {
+                    return Err(icu::ILLEGAL_ARGUMENT_ERROR);
+                }
                 self.write_raw(&replacement);
 
                 // After replacing a zero-width match, advance past it so that find_and_select wraps to the
@@ -1464,6 +1619,12 @@ impl TextBuffer {
         while let Some(range) = self.find_select_next(&mut search, offset, false) {
             let replacement =
                 self.find_fill_replacement(&mut search, replacement, &parsed_replacements);
+            if self.is_format_editing()
+                && replacement.iter().any(|byte| matches!(byte, b'\r' | b'\n'))
+            {
+                self.edit_end_grouping();
+                return Err(icu::ILLEGAL_ARGUMENT_ERROR);
+            }
             self.write_raw(&replacement);
 
             // The `active_edit_off` points to the end of the last edit made by `write_raw()`.
@@ -1572,6 +1733,14 @@ impl TextBuffer {
         }
 
         let mut hit = search.regex.next();
+        if let Some(edit) = &self.format_edit {
+            while hit
+                .as_ref()
+                .is_some_and(|range| range.start < edit.source.start || range.end > edit.source.end)
+            {
+                hit = search.regex.next();
+            }
+        }
 
         // If we hit the end of the buffer, and we know that there's something to find,
         // start the search again from the beginning (= wrap around).
@@ -1579,6 +1748,13 @@ impl TextBuffer {
             search.next_search_offset = 0;
             search.regex.reset(0);
             hit = search.regex.next();
+            if let Some(edit) = &self.format_edit {
+                while hit.as_ref().is_some_and(|range| {
+                    range.start < edit.source.start || range.end > edit.source.end
+                }) {
+                    hit = search.regex.next();
+                }
+            }
         }
 
         search.selection_generation = if let Some(range) = &hit {
@@ -1733,11 +1909,15 @@ impl TextBuffer {
 
     fn measurement_config(&self) -> MeasurementConfig<'_> {
         self.ruby_cache.prepare(self.buffer.generation());
-        MeasurementConfig::new(&self.buffer)
+        let config = MeasurementConfig::new(&self.buffer)
             .with_word_wrap_column(self.word_wrap_column)
             .with_wrap_at_any_cluster(self.wrap_chars.is_some())
             .with_tab_size(self.tab_size)
-            .with_hidden_text(if self.ruby_display { Some(&self.ruby_cache) } else { None })
+            .with_hidden_text(if self.ruby_display { Some(&self.ruby_cache) } else { None });
+        match &self.format_edit {
+            Some(edit) => config.with_source_line(&edit.source, &edit.wraps),
+            None => config,
+        }
     }
 
     fn goto_line_start(&self, cursor: Cursor, y: CoordType) -> Cursor {
@@ -2066,12 +2246,17 @@ impl TextBuffer {
     }
 
     fn set_cursor_internal(&mut self, cursor: Cursor) {
+        let cursor = self.constrain_format_cursor(cursor);
         debug_assert!(cursor.offset <= self.text_length());
         debug_assert!(cursor.logical_pos.x >= 0);
         debug_assert!(cursor.logical_pos.y >= 0);
         debug_assert!(cursor.logical_pos.y <= self.stats.logical_lines);
         debug_assert!(cursor.visual_pos.x >= 0);
-        debug_assert!(self.word_wrap_column <= 0 || cursor.visual_pos.x <= self.word_wrap_column);
+        debug_assert!(
+            self.is_format_editing()
+                || self.word_wrap_column <= 0
+                || cursor.visual_pos.x <= self.word_wrap_column
+        );
         debug_assert!(cursor.visual_pos.y >= 0);
         debug_assert!(cursor.visual_pos.y <= self.stats.visual_lines);
         self.cursor = cursor;
@@ -2453,7 +2638,7 @@ impl TextBuffer {
         bytes: &[u8],
         offset: usize,
     ) {
-        if !self.ruby_display {
+        if !self.ruby_display || self.source_is_visible(offset) {
             output.extend_from_slice(arena, bytes);
             return;
         }
@@ -2722,6 +2907,10 @@ impl TextBuffer {
     }
 
     fn write(&mut self, text: &[u8], at: Cursor, raw: bool) {
+        if self.is_format_editing() && text.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+            return;
+        }
+        let at = self.constrain_format_cursor(at);
         let history_type = if raw { HistoryType::Other } else { HistoryType::Write };
         let mut edit_begun = false;
 
@@ -2745,6 +2934,7 @@ impl TextBuffer {
         }
 
         if !edit_begun {
+            let at = self.ruby_insertion_cursor(at);
             self.edit_begin(history_type, at);
         }
 
@@ -2865,7 +3055,8 @@ impl TextBuffer {
         //
         // In order to not annoy people with this, we only add a
         // newline if you just edited the very end of the buffer.
-        if self.insert_final_newline
+        if !self.is_format_editing()
+            && self.insert_final_newline
             && self.cursor.offset > 0
             && self.cursor.offset == self.text_length()
             && self.cursor.logical_pos.x > 0
@@ -3042,6 +3233,9 @@ impl TextBuffer {
 
     /// Displaces the current, cursor or the selection, line(s) in the given direction.
     pub fn move_selected_lines(&mut self, direction: MoveLineDirection) {
+        if self.is_format_editing() {
+            return;
+        }
         let selection = self.selection;
         let cursor = self.cursor;
 
@@ -3212,6 +3406,9 @@ impl TextBuffer {
             self.redo_stack.clear();
             while self.undo_stack.len() > 1000 {
                 self.undo_stack.pop_front();
+                if let Some(edit) = &mut self.format_edit {
+                    edit.undo_floor = edit.undo_floor.saturating_sub(1);
+                }
             }
 
             self.last_history_type = history_type;
@@ -3223,6 +3420,7 @@ impl TextBuffer {
                 cursor: cursor.logical_pos,
                 deleted: Vec::new(),
                 added: Vec::new(),
+                format_wraps_before: self.format_edit.as_ref().map(|edit| edit.wraps.clone()),
             }));
 
             if let Some(info) = &self.active_edit_group
@@ -3237,6 +3435,9 @@ impl TextBuffer {
         }
 
         self.active_edit_off = cursor.offset;
+        if let Some(edit) = &mut self.format_edit {
+            edit.undone = 0;
+        }
         self.highlighter_cache.invalidate_from(cursor.logical_pos.y);
 
         // If word-wrap is enabled, the visual layout of all logical lines affected by the write
@@ -3270,6 +3471,7 @@ impl TextBuffer {
 
         // Write!
         self.buffer.replace(self.active_edit_off..self.active_edit_off, text);
+        self.update_format_offsets(self.active_edit_off..self.active_edit_off, text.len());
 
         // Move self.cursor to the end of the newly written text. Can't use `self.set_cursor_internal`,
         // because we're still in the progress of recalculating the line stats.
@@ -3281,6 +3483,7 @@ impl TextBuffer {
     /// Deletes the text between the current cursor position and `to`.
     /// It records the change in the undo stack.
     fn edit_delete(&mut self, to: Cursor) {
+        let to = self.constrain_format_cursor(to);
         debug_assert!(to.offset >= self.active_edit_off);
 
         let logical_y_before = self.cursor.logical_pos.y;
@@ -3303,6 +3506,9 @@ impl TextBuffer {
         // Delete the portion from the buffer by enlarging the gap.
         let count = to.offset - off;
         self.buffer.allocate_gap(off, 0, count);
+
+        drop(undo);
+        self.update_format_offsets(off..to.offset, 0);
 
         self.stats.logical_lines += logical_y_before - to.logical_pos.y;
     }
@@ -3373,6 +3579,12 @@ impl TextBuffer {
         let mut damage_start = CoordType::MAX;
 
         loop {
+            if let Some(edit) = &self.format_edit {
+                if (undo && self.undo_stack.len() <= edit.undo_floor) || (!undo && edit.undone == 0)
+                {
+                    break;
+                }
+            }
             // Transfer the last entry from the undo stack to the redo stack or vice versa.
             {
                 let (from, to) = if undo {
@@ -3389,6 +3601,13 @@ impl TextBuffer {
                 };
 
                 to.push_back(g);
+            }
+            if let Some(edit) = &mut self.format_edit {
+                if undo {
+                    edit.undone += 1;
+                } else {
+                    edit.undone -= 1;
+                }
             }
 
             self.finish_selection_latch();
@@ -3422,6 +3641,16 @@ impl TextBuffer {
 
                 // Undo: Whatever was deleted is now added and vice versa.
                 mem::swap(&mut change.deleted, &mut change.added);
+                if let Some(edit) = &mut self.format_edit {
+                    let wraps = edit.wraps.clone();
+                    edit.replace(
+                        cursor.offset..cursor.offset + change.deleted.len(),
+                        change.added.len(),
+                    );
+                    if let Some(previous) = &mut change.format_wraps_before {
+                        edit.wraps = mem::replace(previous, wraps);
+                    }
+                }
 
                 // Delete the inserted portion.
                 self.buffer.allocate_gap(cursor.offset, 0, change.deleted.len());
@@ -3494,6 +3723,10 @@ impl TextBuffer {
 
         if entry_buffer_generation.is_some() {
             self.recalc_after_content_changed();
+            if self.is_format_editing() {
+                self.last_history_type = HistoryType::Other;
+                self.reflow();
+            }
         }
     }
 
@@ -3802,6 +4035,299 @@ mod tests {
         assert_eq!(buf.ruby_reading_at_cursor().as_deref(), Some("かんじ"));
         buf.cursor_move_to_visual(Point { x: 2, y: 0 });
         assert_eq!(buf.cursor.offset, "前｜".len());
+    }
+
+    #[test]
+    fn format_editing_reveals_only_the_current_line_and_edits_markup() {
+        let source = "｜前《まえ》\n｜母字《るび》《《圏点》》\n｜後《あと》";
+        let mut buf = ruby_buffer(source);
+        buf.cursor_move_to_logical(Point { x: 2, y: 1 });
+        assert!(buf.toggle_format_editing());
+        assert!(buf.is_format_editing());
+        let mut fb = Framebuffer::new();
+        fb.flip(Size { width: 80, height: 6 });
+        buf.render(Point::default(), Rect { left: 0, top: 0, right: 80, bottom: 6 }, true, &mut fb);
+        let scratch = scratch_arena(None);
+        let rendered = fb.render(&scratch);
+        for text in ["｜", "母字", "《るび》《《", "圏点", "》》"] {
+            assert!(rendered.contains(text), "{rendered:?}");
+        }
+        assert!(!rendered.contains("まえ"), "{rendered:?}");
+        assert!(!rendered.contains("あと"), "{rendered:?}");
+
+        buf.cursor_move_to_offset("｜前《まえ》\n｜母字《る".len());
+        buf.write_canon("ー".as_bytes());
+        assert!(buffer_contents(&mut buf).contains("《るーび》"));
+        buf.undo();
+        assert_eq!(buffer_contents(&mut buf), source);
+        buf.redo();
+        assert!(buffer_contents(&mut buf).contains("《るーび》"));
+        assert!(buf.toggle_format_editing());
+        assert!(!buf.is_format_editing());
+        assert!(buf.cursor.offset >= "｜前《まえ》\n｜母字《るーび》".len());
+        assert_eq!(buf.cursor.logical_pos.y, 1);
+    }
+
+    #[test]
+    fn format_editing_constrains_navigation_selection_and_structural_edits() {
+        let source = "前の行\n《《母字》》\n後の行";
+        let mut buf = ruby_buffer(source);
+        buf.cursor_move_to_logical(Point { x: 2, y: 1 });
+        assert!(buf.toggle_format_editing());
+        let start = "前の行\n".len();
+        let end = "前の行\n《《母字》》".len();
+        buf.undo();
+        assert_eq!(buffer_contents(&mut buf), source);
+        buf.cursor_move_to_offset(0);
+        assert_eq!(buf.cursor.offset, start);
+        buf.cursor_move_delta(CursorMovement::Grapheme, -10);
+        assert_eq!(buf.cursor.offset, start);
+        buf.cursor_move_to_logical(Point::MAX);
+        assert_eq!(buf.cursor.offset, end);
+        buf.cursor_move_to_visual(Point::MAX);
+        assert_eq!(buf.cursor.offset, end);
+        buf.cursor_move_delta(CursorMovement::Word, 10);
+        assert_eq!(buf.cursor.offset, end);
+        buf.delete(CursorMovement::Grapheme, 1);
+        buf.cursor_move_to_offset(start);
+        buf.delete(CursorMovement::Word, -1);
+        buf.write_canon(b"\n");
+        buf.write_raw(b"a\nb");
+        buf.move_selected_lines(super::MoveLineDirection::Down);
+        buf.normalize_newlines(true);
+        assert_eq!(buffer_contents(&mut buf), source);
+
+        buf.selection_update_offset(0);
+        buf.selection_update_logical(Point::MAX);
+        let (beg, finish) = buf.selection_range().unwrap();
+        assert_eq!((beg.offset, finish.offset), (start, end));
+        buf.select_all();
+        assert_eq!(buf.extract_user_selection(false).unwrap(), "《《母字》》".as_bytes());
+        buf.write_canon("《《編集》》".as_bytes());
+        assert_eq!(buffer_contents(&mut buf), "前の行\n《《編集》》\n後の行");
+        buf.undo();
+        buf.undo();
+        assert_eq!(buffer_contents(&mut buf), source);
+        assert_eq!(buf.cursor.logical_pos.y, 1);
+        buf.redo();
+        assert_eq!(buffer_contents(&mut buf), "前の行\n《《編集》》\n後の行");
+        assert_eq!(buf.cursor.logical_pos.y, 1);
+    }
+
+    #[test]
+    fn format_editing_search_and_replacement_stay_on_the_current_line() {
+        let source = "母字\n｜母字《るび》《《母字》》\n母字";
+        let mut buf = ruby_buffer(source);
+        assert!(!buf.toggle_format_editing());
+        buf.cursor_move_to_offset("母字\n｜".len());
+        assert!(buf.toggle_format_editing());
+        buf.find_and_select("母字", SearchOptions::default()).unwrap();
+        assert_eq!(buf.cursor.logical_pos.y, 1);
+        assert!(buf.find_and_replace_all("母字", SearchOptions::default(), b"a\nb").is_err());
+        assert_eq!(buffer_contents(&mut buf), source);
+        buf.find_and_replace_all("母字", SearchOptions::default(), "本文".as_bytes()).unwrap();
+        assert_eq!(buffer_contents(&mut buf), "母字\n｜本文《るび》《《本文》》\n母字");
+        assert_eq!(buf.cursor.logical_pos.y, 1);
+        buf.find_and_select("存在しない", SearchOptions::default()).unwrap();
+        assert_eq!(buf.cursor.logical_pos.y, 1);
+        buf.undo();
+        assert_eq!(buffer_contents(&mut buf), source);
+        buf.toggle_format_editing();
+        buf.cursor_move_to_offset(0);
+        assert_eq!(buf.cursor.offset, 0);
+    }
+
+    #[test]
+    fn format_editing_restores_wrap_boundaries_after_deleting_the_line_and_undo() {
+        let source = "前\n｜母字《るび》あいうえお\n後";
+        let mut buf = ruby_buffer(source);
+        buf.set_wrap_chars(Some(2));
+        buf.set_word_wrap(true);
+        buf.set_width(80);
+        buf.cursor_move_to_offset("前\n｜".len());
+        assert!(buf.toggle_format_editing());
+        let wraps = buf.format_edit.as_ref().unwrap().wraps.clone();
+        assert!(!wraps.is_empty());
+        buf.select_all();
+        buf.delete(CursorMovement::Grapheme, 1);
+        assert_eq!(buffer_contents(&mut buf), "前\n\n後");
+        assert_eq!(buf.cursor.logical_pos.y, 1);
+        buf.undo();
+        assert_eq!(buffer_contents(&mut buf), source);
+        assert_eq!(buf.format_edit.as_ref().unwrap().wraps, wraps);
+        buf.redo();
+        assert_eq!(buffer_contents(&mut buf), "前\n\n後");
+        assert_eq!(buf.cursor.logical_pos.y, 1);
+        buf.toggle_format_editing();
+        assert!(!buf.is_format_editing());
+    }
+
+    #[test]
+    fn format_editing_keeps_opening_markup_and_insertions_on_the_wrapped_row() {
+        let mut buf = ruby_buffer("前\nあい｜母字《るび》うえ\n後");
+        buf.set_wrap_chars(Some(2));
+        buf.set_word_wrap(true);
+        buf.set_width(80);
+        buf.cursor_move_to_offset("前\nあい｜".len());
+        assert!(buf.toggle_format_editing());
+        let row = buf.cursor_move_to_visual_internal(buf.cursor, Point { x: 0, y: 2 });
+        assert_eq!(row.offset, "前\nあい".len());
+        buf.cursor_move_to_visual(Point { x: 0, y: 2 });
+        buf.write_canon(b"A");
+        assert_eq!(buf.cursor.visual_pos, Point { x: 1, y: 2 });
+        assert_eq!(buffer_contents(&mut buf), "前\nあいA｜母字《るび》うえ\n後");
+        buf.undo();
+        assert_eq!(buffer_contents(&mut buf), "前\nあい｜母字《るび》うえ\n後");
+    }
+
+    #[test]
+    fn format_editing_preserves_wraps_and_other_lines() {
+        let source = "先頭\nあ｜母字《るび》いう《《圏点》》えお\n最後";
+        let mut buf = ruby_buffer(source);
+        buf.set_wrap_chars(Some(3));
+        buf.set_word_wrap(true);
+        buf.set_width(80);
+        buf.cursor_move_to_offset("先頭\nあ｜".len());
+        let last = buf.cursor_move_to_logical_internal(buf.cursor, Point { x: 0, y: 2 });
+        let old_rows = buf.stats.visual_lines;
+        let mut old_wraps = Vec::new();
+        for y in 2..last.visual_pos.y {
+            old_wraps
+                .push(buf.cursor_move_to_visual_internal(buf.cursor, Point { x: 0, y }).offset);
+        }
+        assert!(buf.toggle_format_editing());
+        assert_eq!(buf.stats.visual_lines, old_rows);
+        for (i, offset) in old_wraps.iter().enumerate() {
+            let row =
+                buf.cursor_move_to_visual_internal(buf.cursor, Point { x: 0, y: i as isize + 2 });
+            assert_eq!(row.offset, *offset);
+        }
+        let current_last = buf.cursor_move_to_logical_internal(buf.cursor, Point { x: 0, y: 2 });
+        assert_eq!(current_last.visual_pos, last.visual_pos);
+        buf.write_canon(b"extra");
+        assert_eq!(buf.stats.visual_lines, old_rows);
+        buf.undo();
+        assert_eq!(buffer_contents(&mut buf), source);
+        buf.toggle_format_editing();
+        assert_eq!(buf.stats.visual_lines, old_rows);
+    }
+
+    #[test]
+    fn ruby_insertion_uses_source_boundaries_at_each_visible_position() {
+        for prefix in ["", "前"] {
+            let source = format!("{prefix}｜母字《るび》後");
+            for (position, expected) in [
+                (0, format!("{prefix}A｜母字《るび》後")),
+                (1, format!("{prefix}｜母A字《るび》後")),
+                (2, format!("{prefix}｜母字《るび》A後")),
+            ] {
+                for visual in [false, true] {
+                    for raw in [false, true] {
+                        let mut buf = ruby_buffer(&source);
+                        if visual {
+                            buf.cursor_move_to_visual(Point {
+                                x: (prefix.chars().count() as isize + position) * 2,
+                                y: 0,
+                            });
+                        } else {
+                            buf.cursor_move_delta(
+                                CursorMovement::Grapheme,
+                                prefix.chars().count() as isize + position,
+                            );
+                        }
+                        if raw {
+                            buf.write_raw(b"A");
+                        } else {
+                            buf.write_canon(b"A");
+                        }
+                        assert_eq!(buffer_contents(&mut buf), expected);
+                        buf.undo();
+                        assert_eq!(buffer_contents(&mut buf), source);
+                        buf.redo();
+                        assert_eq!(buffer_contents(&mut buf), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emphasis_insertion_uses_source_boundaries_at_each_visible_position() {
+        for prefix in ["", "前"] {
+            let source = format!("{prefix}《《母字》》後");
+            for (position, expected) in [
+                (0, format!("{prefix}A《《母字》》後")),
+                (1, format!("{prefix}《《母A字》》後")),
+                (2, format!("{prefix}《《母字》》A後")),
+            ] {
+                for visual in [false, true] {
+                    for raw in [false, true] {
+                        let mut buf = ruby_buffer(&source);
+                        if visual {
+                            buf.cursor_move_to_visual(Point {
+                                x: (prefix.chars().count() as isize + position) * 2,
+                                y: 0,
+                            });
+                        } else {
+                            buf.cursor_move_delta(
+                                CursorMovement::Grapheme,
+                                prefix.chars().count() as isize + position,
+                            );
+                        }
+                        if raw {
+                            buf.write_raw(b"A");
+                        } else {
+                            buf.write_canon(b"A");
+                        }
+                        assert_eq!(buffer_contents(&mut buf), expected);
+                        buf.undo();
+                        assert_eq!(buffer_contents(&mut buf), source);
+                        buf.redo();
+                        assert_eq!(buffer_contents(&mut buf), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emphasis_boundary_insertion_keeps_successive_input_outside_markup() {
+        let mut buf = ruby_buffer("《《母字》》");
+        buf.write_canon(b"A");
+        buf.write_canon(b"B");
+        assert_eq!(buffer_contents(&mut buf), "AB《《母字》》");
+
+        for next in ["《《圏点》》", "｜漢字《かんじ》"] {
+            let mut buf = ruby_buffer(&format!("《《母字》》{next}"));
+            buf.cursor_move_delta(CursorMovement::Grapheme, 2);
+            buf.write_canon(b"A");
+            assert_eq!(buffer_contents(&mut buf), format!("《《母字》》A{next}"));
+        }
+
+        let mut buf = ruby_buffer("《《母字》》");
+        buf.set_ruby_display(false);
+        buf.cursor_move_to_offset("《《".len());
+        buf.write_canon(b"A");
+        assert_eq!(buffer_contents(&mut buf), "《《A母字》》");
+    }
+
+    #[test]
+    fn ruby_boundary_insertion_keeps_successive_input_outside_markup() {
+        let mut buf = ruby_buffer("｜母字《るび》");
+        buf.write_canon(b"A");
+        buf.write_canon(b"B");
+        assert_eq!(buffer_contents(&mut buf), "AB｜母字《るび》");
+
+        let mut buf = ruby_buffer("｜母字《るび》｜漢字《かんじ》");
+        buf.cursor_move_delta(CursorMovement::Grapheme, 2);
+        buf.write_canon(b"A");
+        assert_eq!(buffer_contents(&mut buf), "｜母字《るび》A｜漢字《かんじ》");
+
+        let mut buf = ruby_buffer("｜母字《るび》");
+        buf.set_ruby_display(false);
+        buf.cursor_move_to_offset("｜".len());
+        buf.write_canon(b"A");
+        assert_eq!(buffer_contents(&mut buf), "｜A母字《るび》");
     }
 
     #[test]

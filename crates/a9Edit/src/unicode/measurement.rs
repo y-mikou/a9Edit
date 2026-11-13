@@ -69,6 +69,7 @@ pub struct MeasurementConfig<'doc> {
     word_wrap_column: CoordType,
     wrap_at_any_cluster: bool,
     hidden_text: Option<&'doc dyn HiddenText>,
+    source_line: Option<(&'doc Range<usize>, &'doc [usize])>,
     buffer: &'doc dyn ReadableDocument,
 }
 
@@ -81,6 +82,7 @@ impl<'doc> MeasurementConfig<'doc> {
             word_wrap_column: 0,
             wrap_at_any_cluster: false,
             hidden_text: None,
+            source_line: None,
             buffer,
         }
     }
@@ -119,6 +121,16 @@ impl<'doc> MeasurementConfig<'doc> {
     pub fn with_hidden_text(mut self, hidden_text: Option<&'doc dyn HiddenText>) -> Self {
         self.hidden_text = hidden_text;
         self
+    }
+
+    /// Show a source line while retaining its existing soft wrap boundaries.
+    pub fn with_source_line(mut self, range: &'doc Range<usize>, wraps: &'doc [usize]) -> Self {
+        self.source_line = Some((range, wraps));
+        self
+    }
+
+    fn in_source_line(&self, offset: usize) -> bool {
+        self.source_line.is_some_and(|(range, _)| range.start <= offset && offset <= range.end)
     }
 
     /// Navigates **forward** to the given absolute offset.
@@ -202,6 +214,18 @@ impl<'doc> MeasurementConfig<'doc> {
         let mut props_next_cluster = ucd_start_of_text_properties();
 
         loop {
+            if let Some((_, wraps)) = self.source_line
+                && wraps.binary_search(&offset).is_ok()
+                && visual_pos_x > 0
+            {
+                if visual_pos_y >= visual_target.y {
+                    break;
+                }
+                visual_pos_y += 1;
+                visual_pos_x = 0;
+                wrap_opp = false;
+                visual_target_x = Self::calc_target_x(visual_target, visual_pos_y);
+            }
             // Have we reached the target already? Stop.
             if offset >= offset_target
                 || logical_pos_x >= logical_target_x
@@ -273,9 +297,10 @@ impl<'doc> MeasurementConfig<'doc> {
                 width = self.tab_size - (column % self.tab_size);
             }
 
-            let hidden = self
-                .hidden_text
-                .is_some_and(|hidden| hidden.hidden_range(self.buffer, offset).is_some());
+            let hidden = !self.in_source_line(offset)
+                && self
+                    .hidden_text
+                    .is_some_and(|hidden| hidden.hidden_range(self.buffer, offset).is_some());
             if hidden {
                 width = 0;
             }
@@ -312,7 +337,10 @@ impl<'doc> MeasurementConfig<'doc> {
 
             // Since this code above may need to revert to a previous `wrap_opp_*`,
             // it must be done before advancing / checking for `ucd_line_break_joins`.
-            if self.word_wrap_column > 0 && visual_pos_x + width > self.word_wrap_column {
+            if self.word_wrap_column > 0
+                && !self.in_source_line(offset)
+                && visual_pos_x + width > self.word_wrap_column
+            {
                 if !wrap_opp {
                     // Otherwise, the lack of a wrap opportunity means that a single word
                     // is wider than the word wrap column. We need to force-break the word.
@@ -365,6 +393,7 @@ impl<'doc> MeasurementConfig<'doc> {
             column += width;
 
             if self.word_wrap_column > 0
+                && !self.in_source_line(offset)
                 && !hidden
                 && (self.wrap_at_any_cluster
                     || !ucd_line_break_joins(props_current_cluster, props_next_cluster))
@@ -379,7 +408,7 @@ impl<'doc> MeasurementConfig<'doc> {
 
         // If we're here, we hit our target. Now the only question is:
         // Is the word we're currently on so wide that it will be wrapped further down the document?
-        if self.word_wrap_column > 0 {
+        if self.word_wrap_column > 0 && !self.in_source_line(offset) {
             if !wrap_opp {
                 // If the current laid-out line had no wrap opportunities, it means we had an input
                 // such as "fooooooooooooooooooooo" at a `word_wrap_column` of e.g. 10. The word

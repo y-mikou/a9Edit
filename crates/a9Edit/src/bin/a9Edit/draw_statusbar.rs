@@ -21,6 +21,9 @@ pub fn draw_messagebar(ctx: &mut Context, state: &State) {
         .active()
         .and_then(|doc| {
             let tb = doc.buffer.borrow();
+            if tb.is_format_editing() {
+                return Some("書式記号表示中".to_string());
+            }
             let warning = tb.forbidden_warning_at_cursor();
             let annotation = tb.annotation_at_cursor();
             match (warning, annotation) {

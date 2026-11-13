@@ -2774,6 +2774,9 @@ impl<'a> Context<'a, '_> {
                     kbmod::CTRL => tb.paste(self.clipboard_ref(), single_line),
                     _ => return false,
                 },
+                vk::R if modifiers == kbmod::ALT && !single_line => {
+                    tb.toggle_format_editing();
+                }
                 vk::Y => match modifiers {
                     kbmod::CTRL => tb.redo(),
                     _ => return false,
@@ -2840,7 +2843,7 @@ impl<'a> Context<'a, '_> {
         scroll_x = scroll_x.max(0);
         scroll_y = scroll_y.clamp(0, tb.visual_line_count() - 1);
 
-        if tb.is_word_wrap_enabled() {
+        if tb.is_word_wrap_enabled() && !tb.is_format_editing() {
             scroll_x = 0;
         }
 
