@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use a9edit::arena::scratch_arena;
+use a9edit::helpers::AsciiStringHelpers as _;
 use a9edit::sys;
-use stdext::AsciiStringHelpers as _;
-use stdext::arena::scratch_arena;
 
 include!(concat!(env!("OUT_DIR"), "/i18n_a9edit.rs"));
 

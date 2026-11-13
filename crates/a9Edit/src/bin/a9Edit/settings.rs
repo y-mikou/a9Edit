@@ -1,12 +1,11 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use a9edit::arena::{arena_format, read_to_string, scratch_arena};
 use a9edit::buffer::{ForbiddenRules, TextBuffer};
 use a9edit::cell::{Ref, SemiRefCell};
 use a9edit::json;
 use a9edit::lsh::{LANGUAGES, Language};
-use stdext::arena::{read_to_string, scratch_arena};
-use stdext::arena_format;
 
 use crate::apperr;
 

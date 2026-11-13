@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use a9edit::arena::{arena_format, scratch_arena};
+use a9edit::collections::BVec;
 use a9edit::framebuffer::{Attributes, IndexedColor};
 use a9edit::fuzzy::score_fuzzy;
 use a9edit::helpers::*;
@@ -8,9 +10,6 @@ use a9edit::icu;
 use a9edit::input::vk;
 use a9edit::lsh::LANGUAGES;
 use a9edit::tui::*;
-use stdext::arena::scratch_arena;
-use stdext::arena_format;
-use stdext::collections::BVec;
 
 use crate::localization::*;
 use crate::state::*;

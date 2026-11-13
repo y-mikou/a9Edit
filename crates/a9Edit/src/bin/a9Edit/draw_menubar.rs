@@ -1,10 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use a9edit::arena::arena_format;
 use a9edit::helpers::*;
 use a9edit::input::{kbmod, vk};
 use a9edit::tui::*;
-use stdext::arena_format;
 
 use crate::localization::*;
 use crate::settings::Settings;

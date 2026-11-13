@@ -1,6 +1,6 @@
 [workspace]
 default-members = ["crates/a9Edit"]
-members = ["crates/*"]
+members = ["crates/a9Edit", "crates/lsh", "crates/unicode-gen"]
 resolver = "3"
 
 [workspace.package]
@@ -25,9 +25,3 @@ incremental = true          # Improves re-compile times
 [profile.bench]
 codegen-units = 16          # Make compiling criterion faster (16 is the default, but profile.release sets it to 1)
 lto = "thin"                # Similarly, speed up linking by a ton
-
-[workspace.dependencies]
-a9edit = { path = "./crates/a9Edit" }
-lsh = { path = "./crates/lsh" }
-stdext = { path = "./crates/stdext" }
-unicode-gen = { path = "./crates/unicode-gen" }

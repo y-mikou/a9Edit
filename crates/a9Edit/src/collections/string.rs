@@ -7,8 +7,8 @@ use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 use std::str::Utf8Error;
 
 use crate::alloc::Allocator;
-use crate::cold_path;
 use crate::collections::BVec;
+use crate::helpers::cold_path;
 
 /// Like a `String` but on borrowed memory. Built on top of [`BVec<u8>`].
 pub struct BString<'a> {
@@ -36,6 +36,12 @@ impl<'a> BString<'a> {
     pub fn from_utf8(vec: BVec<'a, u8>) -> Result<Self, Utf8Error> {
         str::from_utf8(&vec)?;
         Ok(Self { vec })
+    }
+
+    /// Converts this string into a byte vector.
+    #[inline]
+    pub fn into_bytes(self) -> BVec<'a, u8> {
+        self.vec
     }
 
     /// Validates UTF-8, replacing invalid sequences with U+FFFD.
@@ -92,6 +98,21 @@ impl<'a> BString<'a> {
         let mut res = Self::empty();
         res.push_utf16_lossy(alloc, string);
         res
+    }
+
+    /// Constructs a [`BString`] from ptr, length, and capacity.
+    ///
+    /// # Safety
+    ///
+    /// If you pass invalid arguments, this code will `rm -rf` your disk.
+    #[inline]
+    pub unsafe fn from_raw_parts(buf: *mut u8, length: usize, capacity: usize) -> Self {
+        unsafe { Self { vec: BVec::from_raw_parts(buf, length, capacity) } }
+    }
+
+    #[inline]
+    pub fn into_raw_parts(self) -> (*mut u8, usize, usize) {
+        self.vec.into_raw_parts()
     }
 
     /// Length in bytes, not characters.

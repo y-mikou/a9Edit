@@ -6,7 +6,6 @@ use a9edit::helpers::*;
 use a9edit::icu;
 use a9edit::input::{kbmod, vk};
 use a9edit::tui::*;
-use stdext::string_from_utf8_lossy_owned;
 
 use crate::localization::*;
 use crate::state::*;

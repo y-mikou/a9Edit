@@ -1,5 +1,8 @@
 name: Submit release to the WinGet community repository
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:
@@ -35,8 +38,8 @@ jobs:
           $release = gh release view $env:A9EDIT_RELEASE_TAG --json assets,isPrerelease,tagName | ConvertFrom-Json
           if ($release.isPrerelease) { throw "Only stable releases can be submitted." }
           $assets = $release.assets
-          $x64InstallerUrl = $assets | Where-Object -Property name -like '*x86_64-windows.zip' | Select-Object -ExpandProperty url
-          $arm64InstallerUrl = $assets | Where-Object -Property name -like '*aarch64-windows.zip' | Select-Object -ExpandProperty url
+          $x64InstallerUrl = $assets | Where-Object -Property name -like '*x86_64-windows-setup.exe' | Select-Object -ExpandProperty url
+          $arm64InstallerUrl = $assets | Where-Object -Property name -like '*aarch64-windows-setup.exe' | Select-Object -ExpandProperty url
           $packageVersion = $release.tagName.TrimStart('v')
 
           # Update package using wingetcreate

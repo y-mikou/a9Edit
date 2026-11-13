@@ -93,6 +93,28 @@ impl<'a, T> BVec<'a, T> {
         unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), self.len, self.cap) }
     }
 
+    /// Constructs a [`BVec`] from ptr, length, and capacity.
+    ///
+    /// # Safety
+    ///
+    /// If you pass invalid arguments, this code will `rm -rf` your disk.
+    #[inline]
+    pub unsafe fn from_raw_parts(buf: *mut T, length: usize, capacity: usize) -> Self {
+        Self {
+            ptr: unsafe { NonNull::new_unchecked(buf) },
+            len: length,
+            cap: capacity,
+            _marker: PhantomData,
+            #[cfg(debug_assertions)]
+            alloc: None,
+        }
+    }
+
+    #[inline]
+    pub fn into_raw_parts(mut self) -> (*mut T, usize, usize) {
+        (self.as_mut_ptr(), self.len(), self.capacity())
+    }
+
     /// Number of initialized elements.
     #[inline]
     pub fn len(&self) -> usize {
@@ -185,7 +207,7 @@ impl<'a, T> BVec<'a, T> {
         let len = self.len;
         let cap = self.cap;
         if additional > cap - len {
-            self.grow(alloc, self.cap, additional);
+            self.grow(alloc, self.cap, additional, 8);
         }
         unsafe {
             // Right now the following asserts are somewhat useless, because they only work
@@ -206,7 +228,7 @@ impl<'a, T> BVec<'a, T> {
         let len = self.len;
         let cap = self.cap;
         if additional > cap - len {
-            self.grow(alloc, 0, additional);
+            self.grow(alloc, 0, additional, 0);
         }
         unsafe {
             // See reserve().
@@ -220,7 +242,7 @@ impl<'a, T> BVec<'a, T> {
         let len = self.len;
         let cap = self.cap;
         if len >= cap {
-            self.grow(alloc, cap, 1);
+            self.grow(alloc, cap, 1, 8);
         }
         unsafe {
             // See reserve().
@@ -230,7 +252,7 @@ impl<'a, T> BVec<'a, T> {
     }
 
     #[cold]
-    fn grow(&mut self, alloc: &'a dyn Allocator, cap: usize, add: usize) {
+    fn grow(&mut self, alloc: &'a dyn Allocator, cap: usize, add: usize, min: usize) {
         debug_assert!(add > 0, "growing by zero makes no sense");
 
         #[cfg(debug_assertions)]
@@ -239,7 +261,7 @@ impl<'a, T> BVec<'a, T> {
             "switching between allocators on a single BVec heavily suggests you're about to leak memory"
         );
 
-        let new_cap = (cap * 2).max(self.len + add).max(8);
+        let new_cap = (cap * 2).max(self.len + add).max(min);
         let new_ptr = unsafe {
             alloc.realloc(
                 self.ptr.cast(),

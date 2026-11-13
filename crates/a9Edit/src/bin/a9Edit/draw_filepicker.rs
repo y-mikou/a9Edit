@@ -5,13 +5,13 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use a9edit::arena::scratch_arena;
+use a9edit::collections::BVec;
 use a9edit::framebuffer::IndexedColor;
 use a9edit::helpers::*;
 use a9edit::input::{kbmod, vk};
 use a9edit::tui::*;
 use a9edit::{icu, path};
-use stdext::arena::scratch_arena;
-use stdext::collections::BVec;
 
 use crate::localization::*;
 use crate::state::*;
