@@ -236,6 +236,7 @@ pub type RcTextBuffer = Rc<TextBufferCell>;
 /// A text buffer for a text editor.
 struct FormatEdit {
     source: Range<usize>,
+    layout: Range<usize>,
     wraps: Vec<usize>,
     wrap_column: CoordType,
     undo_floor: usize,
@@ -253,13 +254,15 @@ impl FormatEdit {
                 offset - replaced.len() + added
             }
         };
+        let source_end = self.source.end;
         self.source.end = adjust(self.source.end);
+        self.layout.end = adjust(self.layout.end);
         for offset in &mut self.wraps {
-            if *offset != replaced.start {
+            if *offset != replaced.start || *offset == source_end {
                 *offset = adjust(*offset);
             }
         }
-        self.wraps.retain(|&offset| offset > self.source.start && offset < self.source.end);
+        self.wraps.retain(|&offset| offset > self.layout.start && offset < self.layout.end);
         self.wraps.dedup();
     }
 }
@@ -631,7 +634,7 @@ impl TextBuffer {
         self.format_edit.is_some()
     }
 
-    /// Toggle source editing for the annotated logical line under the caret.
+    /// Toggle source editing for the visual row under the caret.
     pub fn toggle_format_editing(&mut self) -> bool {
         if self.format_edit.is_some() {
             self.format_edit = None;
@@ -643,13 +646,7 @@ impl TextBuffer {
             self.make_cursor_visible();
             return true;
         }
-        if !self.ruby_display
-            || !self
-                .ruby_line(self.cursor.offset)
-                .ruby
-                .iter()
-                .any(|ruby| (ruby.markup.start..ruby.base.end).contains(&self.cursor.offset))
-        {
+        if !self.ruby_display {
             return false;
         }
         let start = self.goto_line_start(self.cursor, self.cursor.logical_pos.y);
@@ -664,11 +661,17 @@ impl TextBuffer {
                 wraps.push(self.ruby_insertion_cursor(row).offset);
             }
         }
+        let row = self.cursor.visual_pos.y;
+        let row_start = self.cursor_move_to_visual_internal(start, Point { x: 0, y: row });
+        let source_start = self.ruby_insertion_cursor(row_start).offset;
+        let source_end =
+            wraps.iter().copied().find(|&offset| offset > source_start).unwrap_or(end.offset);
         self.clear_selection();
         self.search = None;
         self.last_history_type = HistoryType::Other;
         self.format_edit = Some(FormatEdit {
-            source: start.offset..end.offset,
+            source: source_start..source_end,
+            layout: start.offset..end.offset,
             wraps,
             wrap_column: self.word_wrap_column,
             undo_floor: self.undo_stack.len(),
@@ -680,9 +683,7 @@ impl TextBuffer {
     }
 
     fn source_is_visible(&self, offset: usize) -> bool {
-        self.format_edit
-            .as_ref()
-            .is_some_and(|edit| edit.source.start <= offset && offset <= edit.source.end)
+        self.format_edit.as_ref().is_some_and(|edit| edit.source.contains(&offset))
     }
 
     fn constrain_format_cursor(&self, cursor: Cursor) -> Cursor {
@@ -1915,7 +1916,7 @@ impl TextBuffer {
             .with_tab_size(self.tab_size)
             .with_hidden_text(if self.ruby_display { Some(&self.ruby_cache) } else { None });
         match &self.format_edit {
-            Some(edit) => config.with_source_line(&edit.source, &edit.wraps),
+            Some(edit) => config.with_source_line(&edit.layout, &edit.source, &edit.wraps),
             None => config,
         }
     }
@@ -4038,6 +4039,72 @@ mod tests {
     }
 
     #[test]
+    fn format_editing_can_start_on_plain_text_and_empty_rows() {
+        for source in ["", "本文", "前\n\n後", "前｜漢字《かんじ》後《《点》》"]
+        {
+            let mut buf = ruby_buffer(source);
+            if source.contains('\n') {
+                buf.cursor_move_to_logical(Point { x: 0, y: 1 });
+            }
+            assert!(buf.toggle_format_editing());
+            assert!(buf.is_format_editing());
+            assert!(buf.toggle_format_editing());
+            assert!(!buf.is_format_editing());
+            assert_eq!(buffer_contents(&mut buf), source);
+        }
+    }
+
+    #[test]
+    fn format_editing_reveals_all_annotations_only_on_the_caret_wrapped_row() {
+        let source = "｜前《まえ》あ｜漢《かん》《《点》》い｜後《あと》";
+        let mut buf = ruby_buffer(source);
+        buf.set_wrap_chars(Some(2));
+        buf.set_word_wrap(true);
+        buf.set_width(80);
+        buf.cursor_move_to_offset("｜前《まえ》".len());
+        assert!(buf.toggle_format_editing());
+        assert_eq!(buf.format_edit.as_ref().unwrap().source, 0.."｜前《まえ》あ".len());
+        assert!(buf.toggle_format_editing());
+        buf.cursor_move_to_visual(Point { x: 0, y: 1 });
+        assert!(buf.toggle_format_editing());
+        assert_eq!(
+            buf.format_edit.as_ref().unwrap().source,
+            "｜前《まえ》あ".len().."｜前《まえ》あ｜漢《かん》《《点》》".len()
+        );
+        let mut fb = Framebuffer::new();
+        fb.flip(Size { width: 80, height: 6 });
+        buf.render(Point::default(), Rect { left: 0, top: 0, right: 80, bottom: 6 }, true, &mut fb);
+        let scratch = scratch_arena(None);
+        let rendered = fb.render(&scratch);
+        for text in ["｜", "漢", "《かん》《《", "点", "》》"] {
+            assert!(rendered.contains(text), "{rendered:?}");
+        }
+        assert!(!rendered.contains("まえ"), "{rendered:?}");
+        assert!(!rendered.contains("あと"), "{rendered:?}");
+        buf.toggle_format_editing();
+        assert_eq!(buffer_contents(&mut buf), source);
+    }
+
+    #[test]
+    fn format_editing_keeps_end_insertions_on_the_selected_wrapped_row() {
+        let source = "あい《《点》》うえお";
+        let mut buf = ruby_buffer(source);
+        buf.set_wrap_chars(Some(2));
+        buf.set_word_wrap(true);
+        buf.set_width(80);
+        buf.cursor_move_to_visual(Point { x: 0, y: 1 });
+        assert!(buf.toggle_format_editing());
+        buf.cursor_move_to_offset(usize::MAX);
+        buf.write_canon(b"A");
+        assert_eq!(buf.cursor.visual_pos.y, 1);
+        assert_eq!(buffer_contents(&mut buf), "あい《《点》》うAえお");
+        buf.undo();
+        assert_eq!(buffer_contents(&mut buf), source);
+        buf.select_all();
+        assert_eq!(buf.extract_user_selection(false).unwrap(), "《《点》》う".as_bytes());
+    }
+
+    #[test]
     fn format_editing_reveals_only_the_current_line_and_edits_markup() {
         let source = "｜前《まえ》\n｜母字《るび》《《圏点》》\n｜後《あと》";
         let mut buf = ruby_buffer(source);
@@ -4118,7 +4185,8 @@ mod tests {
     fn format_editing_search_and_replacement_stay_on_the_current_line() {
         let source = "母字\n｜母字《るび》《《母字》》\n母字";
         let mut buf = ruby_buffer(source);
-        assert!(!buf.toggle_format_editing());
+        assert!(buf.toggle_format_editing());
+        assert!(buf.toggle_format_editing());
         buf.cursor_move_to_offset("母字\n｜".len());
         assert!(buf.toggle_format_editing());
         buf.find_and_select("母字", SearchOptions::default()).unwrap();
@@ -4150,13 +4218,13 @@ mod tests {
         assert!(!wraps.is_empty());
         buf.select_all();
         buf.delete(CursorMovement::Grapheme, 1);
-        assert_eq!(buffer_contents(&mut buf), "前\n\n後");
+        assert_eq!(buffer_contents(&mut buf), "前\nあいうえお\n後");
         assert_eq!(buf.cursor.logical_pos.y, 1);
         buf.undo();
         assert_eq!(buffer_contents(&mut buf), source);
         assert_eq!(buf.format_edit.as_ref().unwrap().wraps, wraps);
         buf.redo();
-        assert_eq!(buffer_contents(&mut buf), "前\n\n後");
+        assert_eq!(buffer_contents(&mut buf), "前\nあいうえお\n後");
         assert_eq!(buf.cursor.logical_pos.y, 1);
         buf.toggle_format_editing();
         assert!(!buf.is_format_editing());

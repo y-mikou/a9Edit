@@ -69,6 +69,7 @@ pub struct MeasurementConfig<'doc> {
     word_wrap_column: CoordType,
     wrap_at_any_cluster: bool,
     hidden_text: Option<&'doc dyn HiddenText>,
+    visible_source: Option<&'doc Range<usize>>,
     source_line: Option<(&'doc Range<usize>, &'doc [usize])>,
     buffer: &'doc dyn ReadableDocument,
 }
@@ -83,6 +84,7 @@ impl<'doc> MeasurementConfig<'doc> {
             wrap_at_any_cluster: false,
             hidden_text: None,
             source_line: None,
+            visible_source: None,
             buffer,
         }
     }
@@ -123,8 +125,14 @@ impl<'doc> MeasurementConfig<'doc> {
         self
     }
 
-    /// Show a source line while retaining its existing soft wrap boundaries.
-    pub fn with_source_line(mut self, range: &'doc Range<usize>, wraps: &'doc [usize]) -> Self {
+    /// Reveal a source range while retaining the logical line's soft wrap boundaries.
+    pub fn with_source_line(
+        mut self,
+        range: &'doc Range<usize>,
+        visible: &'doc Range<usize>,
+        wraps: &'doc [usize],
+    ) -> Self {
+        self.visible_source = Some(visible);
         self.source_line = Some((range, wraps));
         self
     }
@@ -217,6 +225,8 @@ impl<'doc> MeasurementConfig<'doc> {
             if let Some((_, wraps)) = self.source_line
                 && wraps.binary_search(&offset).is_ok()
                 && visual_pos_x > 0
+                && !((offset >= offset_target || logical_pos_x >= logical_target_x)
+                    && self.visible_source.is_some_and(|range| offset == range.end))
             {
                 if visual_pos_y >= visual_target.y {
                     break;
@@ -297,7 +307,7 @@ impl<'doc> MeasurementConfig<'doc> {
                 width = self.tab_size - (column % self.tab_size);
             }
 
-            let hidden = !self.in_source_line(offset)
+            let hidden = !self.visible_source.is_some_and(|range| range.contains(&offset))
                 && self
                     .hidden_text
                     .is_some_and(|hidden| hidden.hidden_range(self.buffer, offset).is_some());
