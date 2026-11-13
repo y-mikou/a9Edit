@@ -255,10 +255,15 @@ fn handle_args_from(
     let mut parse_args = true;
     let mut goto_next = false;
     let mut wrap_chars = None;
+    let mut forbidden_display = false;
 
     // The best CLI argument parser in the world.
     for arg in args {
         if parse_args {
+            if arg == "--forbidden-disp" {
+                forbidden_display = true;
+                continue;
+            }
             if arg == "--wrap" {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -311,6 +316,7 @@ fn handle_args_from(
     }
 
     state.documents.set_wrap_chars(wrap_chars);
+    state.documents.set_forbidden_display(forbidden_display);
 
     for (p, goto) in &paths {
         let doc = state.documents.add_file_path(p)?;
@@ -367,6 +373,7 @@ fn print_help() {
         "Usage: a9Edit [OPTIONS] [FILE]...\n",
         "Options:\n",
         "        --wrap=N                          Wrap at N full-width characters (2 half-width = 1 full-width)\n",
+        "        --forbidden-disp                  Show forbidden-character and ruby-split warnings\n",
         "    -g, --goto <FILE:LINE[:CHARACTER]>    Open a file at the specified line and character position\n",
         "    -h, --help                            Print this help message\n",
         "    -v, --version                         Print the version number\n",
@@ -791,6 +798,46 @@ mod wrap_args_tests {
             let mut state = State::new().unwrap();
             assert!(handle_args_from(&mut state, args.into_iter().map(OsString::from)).is_err());
         }
+    }
+
+    #[test]
+    fn forbidden_disp_applies_to_existing_and_new_documents_only_when_requested() {
+        for enabled in [false, true] {
+            let mut state = State::new().unwrap();
+            state.documents.add_untitled().unwrap();
+            let mut args = vec!["--wrap=2"];
+            if enabled {
+                args.push("--forbidden-disp");
+            }
+            handle_args_from(&mut state, args.into_iter().map(OsString::from)).unwrap();
+            for create_new in [false, true] {
+                let doc = if create_new {
+                    state.documents.add_untitled().unwrap()
+                } else {
+                    state.documents.active().unwrap()
+                };
+                let mut tb = doc.buffer.borrow_mut();
+                tb.write_raw("あ｜漢字《かんじ》う".as_bytes());
+                tb.set_width(80);
+                tb.cursor_move_to_offset("あ｜".len());
+                assert_eq!(tb.forbidden_warning_at_cursor().is_some(), enabled);
+            }
+        }
+    }
+
+    #[test]
+    fn double_dash_keeps_forbidden_disp_as_a_filename() {
+        let mut state = State::new().unwrap();
+        handle_args_from(&mut state, ["--", "--forbidden-disp"].map(OsString::from)).unwrap();
+        let doc = state.documents.active().unwrap();
+        assert_eq!(doc.filename, "--forbidden-disp");
+        let mut tb = doc.buffer.borrow_mut();
+        tb.set_wrap_chars(Some(2));
+        tb.set_word_wrap(true);
+        tb.write_raw("あ｜漢字《かんじ》う".as_bytes());
+        tb.set_width(80);
+        tb.cursor_move_to_offset("あ｜".len());
+        assert_eq!(tb.forbidden_warning_at_cursor(), None);
     }
 
     #[test]

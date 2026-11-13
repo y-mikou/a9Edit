@@ -125,9 +125,17 @@ impl Document {
 pub struct DocumentManager {
     list: Vec<Document>,
     wrap_chars: Option<CoordType>,
+    forbidden_display: bool,
 }
 
 impl DocumentManager {
+    pub fn set_forbidden_display(&mut self, enabled: bool) {
+        self.forbidden_display = enabled;
+        for doc in &self.list {
+            doc.buffer.borrow_mut().set_forbidden_display(enabled);
+        }
+    }
+
     pub fn set_wrap_chars(&mut self, wrap_chars: Option<CoordType>) {
         self.wrap_chars = wrap_chars;
         for doc in &self.list {
@@ -302,6 +310,7 @@ impl DocumentManager {
             tb.set_margin_enabled(true);
             tb.set_line_highlight_enabled(true);
             tb.set_ruby_display(true);
+            tb.set_forbidden_display(self.forbidden_display);
             tb.set_forbidden_rules(Settings::borrow().forbidden.clone());
             tb.set_wrap_chars(self.wrap_chars);
             if self.wrap_chars.is_some() {

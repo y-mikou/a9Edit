@@ -335,6 +335,7 @@ pub struct TextBuffer {
     ruby_display: bool,
     format_edit: Option<FormatEdit>,
     forbidden_rules: Option<Rc<ForbiddenRules>>,
+    forbidden_display: bool,
     warning_cache: std::cell::RefCell<forbidden::WarningCache>,
 
     width: CoordType,
@@ -393,6 +394,7 @@ impl TextBuffer {
             ruby_display: false,
             format_edit: None,
             forbidden_rules: None,
+            forbidden_display: false,
             warning_cache: Default::default(),
 
             width: 0,
@@ -738,12 +740,20 @@ impl TextBuffer {
             })
     }
 
+    /// Enable configured forbidden-character and automatic ruby-split warnings.
+    pub fn set_forbidden_display(&mut self, enabled: bool) {
+        self.forbidden_display = enabled;
+    }
+
     pub fn set_forbidden_rules(&mut self, rules: Option<Rc<ForbiddenRules>>) {
         self.forbidden_rules = rules;
         *self.warning_cache.borrow_mut() = Default::default();
     }
 
     fn forbidden_line_warnings(&self, start: Cursor) -> Rc<Vec<forbidden::Warning>> {
+        if !self.forbidden_display {
+            return Rc::new(Vec::new());
+        }
         let key = (self.buffer.generation(), self.word_wrap_column, self.ruby_display);
         {
             let mut cache = self.warning_cache.borrow_mut();
@@ -756,9 +766,23 @@ impl TextBuffer {
             }
         }
         let mut cells = Vec::new();
-        if let Some(rules) = &self.forbidden_rules
-            && self.word_wrap_column > 0
-        {
+        if self.word_wrap_column > 0 {
+            let bases = if self.ruby_display {
+                self.ruby_line(start.offset)
+                    .ruby
+                    .iter()
+                    .filter(|ruby| matches!(ruby.kind, ruby::AnnotationKind::Ruby(_)))
+                    .map(|ruby| ruby.base.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if self.forbidden_rules.is_none() && bases.is_empty() {
+                return Rc::new(Vec::new());
+            }
+            let default_rules = ForbiddenRules::default();
+            let rules = self.forbidden_rules.as_deref().unwrap_or(&default_rules);
+
             let mut cursor = start;
             let mut config = self.measurement_config().with_cursor(start);
             loop {
@@ -786,16 +810,6 @@ impl TextBuffer {
                 }
                 cursor = next;
             }
-            let bases = if self.ruby_display {
-                self.ruby_line(start.offset)
-                    .ruby
-                    .iter()
-                    .filter(|ruby| matches!(ruby.kind, ruby::AnnotationKind::Ruby(_)))
-                    .map(|ruby| ruby.base.clone())
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
             let warnings = Rc::new(forbidden::warnings(&cells, rules, &bases));
             self.warning_cache.borrow_mut().lines.insert(start.offset, warnings.clone());
             return warnings;
@@ -804,7 +818,10 @@ impl TextBuffer {
     }
 
     pub fn forbidden_warning_at_cursor(&self) -> Option<String> {
-        if self.forbidden_rules.is_none() || self.word_wrap_column <= 0 {
+        if !self.forbidden_display
+            || self.word_wrap_column <= 0
+            || (self.forbidden_rules.is_none() && !self.ruby_display)
+        {
             return None;
         }
         let cursor = self.skip_hidden_ruby(self.cursor, 1);
@@ -2650,7 +2667,10 @@ impl TextBuffer {
         lines: Range<CoordType>,
         fb: &mut Framebuffer,
     ) {
-        if self.forbidden_rules.is_none() || self.word_wrap_column <= 0 {
+        if !self.forbidden_display
+            || self.word_wrap_column <= 0
+            || (self.forbidden_rules.is_none() && !self.ruby_display)
+        {
             return;
         }
         let mut cursor = self.cursor_for_rendering.unwrap();
@@ -4844,6 +4864,7 @@ mod tests {
         let mut buf = TextBuffer::new(false).unwrap();
         buf.set_crlf(false);
         buf.set_ruby_display(true);
+        buf.set_forbidden_display(true);
         buf.write_raw(text.as_bytes());
         buf.set_width(80);
         buf.cursor_move_to_logical(Point::default());
@@ -4919,6 +4940,79 @@ mod tests {
         assert_eq!(warnings.len(), 2);
         assert_eq!(warnings[0].source, 0.."か\u{3099}".len());
         assert!(warnings.iter().all(|warning| warning.width == 2));
+    }
+
+    #[test]
+    fn forbidden_display_defaults_off_and_gates_both_warning_kinds() {
+        for configured in [false, true] {
+            let mut buf = prep_buffer("あ｜漢字《かんじ》、");
+            buf.set_ruby_display(true);
+            buf.set_wrap_chars(Some(2));
+            buf.set_word_wrap(true);
+            buf.set_width(80);
+            if configured {
+                buf.set_forbidden_rules(Some(Rc::new(ForbiddenRules {
+                    line_end: "、".to_string(),
+                    ..Default::default()
+                })));
+            }
+            buf.cursor_move_to_offset("あ｜".len());
+            let start = buf.goto_line_start(buf.cursor, 0);
+            assert!(buf.forbidden_line_warnings(start).is_empty());
+            assert_eq!(buf.forbidden_warning_at_cursor(), None);
+            buf.set_forbidden_display(true);
+            assert_eq!(buf.forbidden_line_warnings(start).len(), if configured { 3 } else { 2 });
+            assert!(buf.forbidden_warning_at_cursor().unwrap().contains("ルビの母字"));
+            buf.cursor_move_to_offset("あ｜漢字《かんじ》".len());
+            assert_eq!(buf.forbidden_warning_at_cursor().is_some(), configured);
+            buf.set_forbidden_display(false);
+            assert!(buf.forbidden_line_warnings(start).is_empty());
+            assert_eq!(buf.forbidden_warning_at_cursor(), None);
+            buf.set_forbidden_display(true);
+            assert_eq!(buf.forbidden_warning_at_cursor().is_some(), configured);
+        }
+    }
+
+    #[test]
+    fn ruby_base_split_warns_without_forbidden_settings() {
+        let source = "あ｜漢字《かんじ》う";
+        let mut buf = ruby_buffer(source);
+        buf.set_wrap_chars(Some(2));
+        buf.set_word_wrap(true);
+        buf.set_width(80);
+        buf.cursor_move_to_offset("あ｜".len());
+        assert!(buf.forbidden_warning_at_cursor().unwrap().contains("ルビの母字"));
+        let warnings = buf.forbidden_line_warnings(buf.goto_line_start(buf.cursor, 0));
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].pos, Point { x: 2, y: 0 });
+        assert_eq!(warnings[1].pos, Point { x: 0, y: 1 });
+
+        fn render(buf: &mut TextBuffer) -> String {
+            let mut fb = Framebuffer::new();
+            fb.flip(Size { width: 80, height: 6 });
+            buf.render(
+                Point::default(),
+                Rect { left: 0, top: 0, right: 80, bottom: 6 },
+                true,
+                &mut fb,
+            );
+            let scratch = scratch_arena(None);
+            fb.render(&scratch).to_string()
+        }
+        let without_settings = render(&mut buf);
+        buf.set_forbidden_rules(Some(Rc::new(ForbiddenRules::default())));
+        assert_eq!(without_settings, render(&mut buf));
+        buf.set_forbidden_rules(None);
+        buf.cursor_move_to_offset("あ｜漢".len());
+        assert!(buf.forbidden_warning_at_cursor().unwrap().contains("ルビの母字"));
+        buf.set_wrap_chars(Some(4));
+        assert_eq!(buf.forbidden_warning_at_cursor(), None);
+        buf.set_wrap_chars(Some(2));
+        assert!(buf.forbidden_warning_at_cursor().is_some());
+        buf.set_word_wrap(false);
+        buf.set_width(80);
+        assert_eq!(buf.forbidden_warning_at_cursor(), None);
+        assert_eq!(buffer_contents(&mut buf), source);
     }
 
     #[test]
@@ -5566,7 +5660,8 @@ mod tests {
         let rendered = fb.render(&scratch);
         assert!(rendered.contains("前"));
         assert!(rendered.contains("圏"));
-        assert!(rendered.contains("点漢"));
+        assert!(rendered.contains("点"));
+        assert!(rendered.contains("漢"));
         assert!(!rendered.contains('《'));
         assert!(!rendered.contains('》'));
         assert!(!rendered.contains('｜'));
