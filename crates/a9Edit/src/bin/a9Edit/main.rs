@@ -256,10 +256,15 @@ fn handle_args_from(
     let mut goto_next = false;
     let mut wrap_chars = None;
     let mut forbidden_display = false;
+    let mut styled = false;
 
     // The best CLI argument parser in the world.
     for arg in args {
         if parse_args {
+            if arg == "--styled" {
+                styled = true;
+                continue;
+            }
             if arg == "--forbidden-disp" {
                 forbidden_display = true;
                 continue;
@@ -316,6 +321,7 @@ fn handle_args_from(
     }
 
     state.documents.set_wrap_chars(wrap_chars);
+    state.documents.set_styled(styled);
     state.documents.set_forbidden_display(forbidden_display);
 
     for (p, goto) in &paths {
@@ -373,7 +379,8 @@ fn print_help() {
         "Usage: a9Edit [OPTIONS] [FILE]...\n",
         "Options:\n",
         "        --wrap=N                          Wrap at N full-width characters (2 half-width = 1 full-width)\n",
-        "        --forbidden-disp                  Show forbidden-character and ruby-split warnings\n",
+        "        --styled                          Collapse ruby and emphasis markup\n",
+        "        --forbidden-disp                  Show forbidden-character and ruby-split warnings (requires --styled)\n",
         "    -g, --goto <FILE:LINE[:CHARACTER]>    Open a file at the specified line and character position\n",
         "    -h, --help                            Print this help message\n",
         "    -v, --version                         Print the version number\n",
@@ -801,28 +808,78 @@ mod wrap_args_tests {
     }
 
     #[test]
-    fn forbidden_disp_applies_to_existing_and_new_documents_only_when_requested() {
-        for enabled in [false, true] {
-            let mut state = State::new().unwrap();
-            state.documents.add_untitled().unwrap();
-            let mut args = vec!["--wrap=2"];
-            if enabled {
-                args.push("--forbidden-disp");
-            }
-            handle_args_from(&mut state, args.into_iter().map(OsString::from)).unwrap();
-            for create_new in [false, true] {
-                let doc = if create_new {
-                    state.documents.add_untitled().unwrap()
-                } else {
-                    state.documents.active().unwrap()
-                };
-                let mut tb = doc.buffer.borrow_mut();
-                tb.write_raw("あ｜漢字《かんじ》う".as_bytes());
-                tb.set_width(80);
-                tb.cursor_move_to_offset("あ｜".len());
-                assert_eq!(tb.forbidden_warning_at_cursor().is_some(), enabled);
+    fn styled_and_forbidden_options_apply_to_existing_and_new_documents() {
+        for styled in [false, true] {
+            for warnings in [false, true] {
+                let mut state = State::new().unwrap();
+                state.documents.add_untitled().unwrap();
+                let mut args = vec!["--wrap=2"];
+                if warnings {
+                    args.push("--forbidden-disp");
+                }
+                if styled {
+                    args.push("--styled");
+                }
+                handle_args_from(&mut state, args.into_iter().map(OsString::from)).unwrap();
+                for create_new in [false, true] {
+                    let doc = if create_new {
+                        state.documents.add_untitled().unwrap()
+                    } else {
+                        state.documents.active().unwrap()
+                    };
+                    let mut tb = doc.buffer.borrow_mut();
+                    tb.set_margin_enabled(false);
+                    tb.write_raw("あ｜漢字《かんじ》《《点》》う".as_bytes());
+                    tb.set_width(80);
+                    tb.cursor_move_to_offset("あ｜".len());
+                    assert_eq!(tb.ruby_reading_at_cursor().as_deref(), styled.then_some("かんじ"));
+                    assert_eq!(
+                        tb.cursor_visual_pos(),
+                        if styled { Point { x: 2, y: 0 } } else { Point { x: 4, y: 0 } }
+                    );
+                    assert_eq!(tb.forbidden_warning_at_cursor().is_some(), styled && warnings);
+                    tb.set_forbidden_rules(Some(std::rc::Rc::new(
+                        a9edit::buffer::ForbiddenRules {
+                            line_end: "あ｜漢字《かんじ》点う".to_string(),
+                            ..Default::default()
+                        },
+                    )));
+                    assert_eq!(tb.forbidden_warning_at_cursor().is_some(), styled && warnings);
+                    tb.cursor_move_to_offset("あ".len());
+                    assert_eq!(tb.forbidden_warning_at_cursor().is_some(), styled && warnings);
+                    tb.cursor_move_to_offset("あ｜漢字《かんじ》《《".len());
+                    assert_eq!(tb.annotation_at_cursor().as_deref(), styled.then_some("圏点:[﹅]"));
+                    if !styled {
+                        assert!(!tb.toggle_format_editing());
+                    }
+                    let mut fb = framebuffer::Framebuffer::new();
+                    fb.flip(Size { width: 80, height: 20 });
+                    tb.render(
+                        Point::default(),
+                        Rect { left: 0, top: 0, right: 80, bottom: 20 },
+                        false,
+                        &mut fb,
+                    );
+                    let scratch = scratch_arena(None);
+                    let rendered = fb.render(&scratch);
+                    for marker in ['｜', '《', '》'] {
+                        assert_eq!(rendered.contains(marker), !styled);
+                    }
+                }
             }
         }
+    }
+
+    #[test]
+    fn double_dash_keeps_styled_as_a_filename() {
+        let mut state = State::new().unwrap();
+        handle_args_from(&mut state, ["--", "--styled"].map(OsString::from)).unwrap();
+        let doc = state.documents.active().unwrap();
+        assert_eq!(doc.filename, "--styled");
+        let mut tb = doc.buffer.borrow_mut();
+        tb.write_raw("｜漢字《かんじ》".as_bytes());
+        tb.cursor_move_to_offset("｜".len());
+        assert_eq!(tb.annotation_at_cursor(), None);
     }
 
     #[test]

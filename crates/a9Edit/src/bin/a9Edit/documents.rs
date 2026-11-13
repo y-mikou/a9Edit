@@ -126,13 +126,23 @@ pub struct DocumentManager {
     list: Vec<Document>,
     wrap_chars: Option<CoordType>,
     forbidden_display: bool,
+    styled: bool,
 }
 
 impl DocumentManager {
+    pub fn set_styled(&mut self, enabled: bool) {
+        self.styled = enabled;
+        for doc in &self.list {
+            let mut tb = doc.buffer.borrow_mut();
+            tb.set_ruby_display(enabled);
+            tb.set_forbidden_display(self.forbidden_display && enabled);
+        }
+    }
+
     pub fn set_forbidden_display(&mut self, enabled: bool) {
         self.forbidden_display = enabled;
         for doc in &self.list {
-            doc.buffer.borrow_mut().set_forbidden_display(enabled);
+            doc.buffer.borrow_mut().set_forbidden_display(enabled && self.styled);
         }
     }
 
@@ -309,8 +319,8 @@ impl DocumentManager {
             tb.set_insert_final_newline(!cfg!(windows)); // As mandated by POSIX.
             tb.set_margin_enabled(true);
             tb.set_line_highlight_enabled(true);
-            tb.set_ruby_display(true);
-            tb.set_forbidden_display(self.forbidden_display);
+            tb.set_ruby_display(self.styled);
+            tb.set_forbidden_display(self.forbidden_display && self.styled);
             tb.set_forbidden_rules(Settings::borrow().forbidden.clone());
             tb.set_wrap_chars(self.wrap_chars);
             if self.wrap_chars.is_some() {
