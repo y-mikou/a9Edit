@@ -1458,8 +1458,9 @@ impl TextBuffer {
         let key = input.key();
         let arrow = matches!(key, vk::LEFT | vk::RIGHT | vk::UP | vk::DOWN);
         let modifiers = input.modifiers();
-        if arrow && modifiers.contains(kbmod::CTRL) && modifiers.contains(kbmod::SHIFT) {
+        if key == vk::L && modifiers == kbmod::ALT {
             self.start_selection_latch();
+            return None;
         }
         if self.is_selection_latched() {
             if arrow || matches!(key, vk::HOME | vk::END | vk::PRIOR | vk::NEXT) {
@@ -5030,8 +5031,8 @@ mod tests {
     }
 
     #[test]
-    fn selection_latch_requires_both_ctrl_and_shift_in_terminal_input() {
-        use crate::input::{self, kbmod, vk};
+    fn selection_latch_does_not_start_with_arrow_keys() {
+        use crate::input::{self, vk};
         let mut buf = ruby_buffer("abcdef");
         for (suffix, arrow) in [('A', vk::UP), ('B', vk::DOWN), ('C', vk::RIGHT), ('D', vk::LEFT)] {
             // xterm modifiers: none, Shift, Alt, Alt+Shift, Ctrl, Ctrl+Shift,
@@ -5046,22 +5047,38 @@ mod tests {
                     panic!("failed to decode {sequence:?}");
                 };
                 let mapped = buf.selection_latch_key(key);
-                let starts_latch = matches!(modifier, 6 | 8);
-                assert_eq!(buf.is_selection_latched(), starts_latch, "{sequence:?}");
-                assert!(mapped == Some(if starts_latch { kbmod::SHIFT | arrow } else { key }));
+                assert!(!buf.is_selection_latched(), "{sequence:?}");
+                assert!(mapped == Some(key));
+                assert!(key.key() == arrow);
             }
         }
     }
 
     #[test]
-    fn selection_latch_starts_with_one_step_and_keeps_its_anchor() {
+    fn selection_latch_starts_with_alt_l_in_terminal_input() {
+        use crate::input::{self, kbmod, vk};
+        let mut vt = crate::vt::Parser::new();
+        let mut parser = input::Parser::new();
+        let mut events = parser.parse(vt.parse("\x1bl"));
+        let Some(input::Input::Keyboard(key)) = events.next() else {
+            panic!("failed to decode Alt+L");
+        };
+        assert!(key == kbmod::ALT | vk::L);
+        let mut buf = ruby_buffer("abcdef");
+        assert!(buf.selection_latch_key(key).is_none());
+        assert!(buf.is_selection_latched());
+    }
+
+    #[test]
+    fn selection_latch_starts_with_alt_l_and_keeps_its_anchor() {
         use crate::input::{kbmod, vk};
         let mut buf = ruby_buffer("abcdef");
         buf.cursor_move_to_logical(Point { x: 3, y: 0 });
-        assert!(
-            buf.selection_latch_key(kbmod::CTRL_SHIFT | vk::RIGHT)
-                == Some(kbmod::SHIFT | vk::RIGHT)
-        );
+        assert!(buf.selection_latch_key(kbmod::ALT | vk::L).is_none());
+        assert!(buf.is_selection_latched());
+        assert_eq!(buf.cursor.logical_pos, Point { x: 3, y: 0 });
+        assert!(!buf.has_selection());
+        assert!(buf.selection_latch_key(vk::RIGHT) == Some(kbmod::SHIFT | vk::RIGHT));
         buf.selection_update_delta(CursorMovement::Grapheme, 1);
         assert_eq!(buf.extract_user_selection(false).unwrap(), b"d");
         assert!(buf.selection_latch_key(vk::LEFT) == Some(kbmod::SHIFT | vk::LEFT));
@@ -5070,7 +5087,7 @@ mod tests {
         assert!(buf.is_selection_latched());
         buf.selection_update_delta(CursorMovement::Grapheme, -1);
         assert_eq!(buf.extract_user_selection(false).unwrap(), b"c");
-        buf.selection_latch_key(kbmod::CTRL_SHIFT | vk::RIGHT);
+        assert!(buf.selection_latch_key(kbmod::ALT | vk::L).is_none());
         buf.selection_update_delta(CursorMovement::Grapheme, 2);
         assert_eq!(buf.extract_user_selection(false).unwrap(), b"d");
         assert!(buf.selection_latch_key(vk::HOME) == Some(kbmod::SHIFT | vk::HOME));
